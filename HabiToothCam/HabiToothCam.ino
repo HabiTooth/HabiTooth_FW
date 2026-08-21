@@ -8,24 +8,24 @@
  *   PIN_W_LED   = GPIO6 (D5)  백색 BCR421U EN
  *   GPIO4 (D3)                미사용 - 무반응 확인됨
  *
- *   ※ 원본 핀맵과 다름
- *      원본: UV=D4/GPIO4, W=D3/GPIO5, BOOST_EN=D5/GPIO6
- *      실제 배선을 스윕으로 확인한 결과 위와 같이 수정.
- *      GPIO6은 원래 TPS61023 BOOST_EN 자리였으나
- *      부스트 제외되면서 백색 LED로 전용된 것으로 추정.
- *      -> 확인 필요 / 부스트 재도입 시 EN 핀 재배정 필요
+ * ===== 노출 제어 (2026-08 추가) =====
+ *   AEC/AWB를 수동 고정. 데이터셋 색·밝기 일관성 확보가 목적.
+ *   자동으로 두면 화면 내용에 따라 노출과 색이 매번 달라져
+ *   같은 치석이 사진마다 다른 색으로 찍힘 -> 학습 불가.
+ *
+ *   조명별로 노출값이 따로 있음:
+ *     aec  = UV 촬영용   (UV LED가 어두워서 길게)
+ *     waec = 백색광 촬영용 (백색 LED가 밝아서 짧게)
+ *
+ *   ※ 노란 필터를 상시 장착한 상태를 전제로 함.
+ *     필터/LED/노출값을 바꾸면 흰 종이 기준 촬영부터 다시 할 것.
  *
  * ===== 스위치 =====
  *   누르면 백색 -> UV 연속 촬영. 두 장 모두 브라우저로 자동 다운로드.
- *   (UI 페이지가 열려 있어야 함)
  *
  * ===== 접속 =====
  *   UI     : http://<보드IP>/
  *   스트림 : http://<보드IP>:81/stream
- *
- * ===== 저장 파일명 =====
- *   OUTER_CENTER_WHITE_0813_153012.jpg
- *   <viewType>_<조명>_<월일>_<시분초>.jpg
  */
 
 #include <Arduino.h>
@@ -42,15 +42,20 @@
 #define PIN_W_LED    6
 #define PIN_SW       2
 
-// BCR421U EN 극성. 코드상 OFF인데 LED가 켜져 있으면 0으로 바꾸기.
 #define LED_ACTIVE_HIGH  1
 
 #define PWM_FREQ   5000
-#define PWM_RES    8            // 0~255
-int brightW  = 200;
-int brightUV = 180;
+#define PWM_RES    8
+int brightW  = 255;
+int brightUV = 255;
 
 #define DEBOUNCE_MS  30
+
+// ── 노출 설정 (OV3660: aec 0~1200, agc 0~30) ──
+int g_uvAec    = 200;   // FireBeetle 스윕에서 확정된 값
+int g_uvAgc    = 4;
+int g_whiteAec = 750;   // 흰 종이가 회색으로 나오면 올릴 것
+int g_whiteAgc = 0;
 
 // ── 촬영 구역 ─────────────────────────────────
 String VIEW_TYPE = "OUTER_CENTER";
@@ -63,13 +68,77 @@ SemaphoreHandle_t camMutex;
 enum LedMode { LED_OFF = 0, LED_WHITE, LED_UV };
 LedMode currentLed = LED_OFF;
 
-// 스위치로 찍은 이미지 임시 보관 (0=백색, 1=UV)
-// 브라우저가 가져갈 때까지 1~2초간만 들고 있습니다.
 uint8_t*          pendBuf[2] = { nullptr, nullptr };
 size_t            pendLen[2] = { 0, 0 };
 String            pendName[2];
 volatile uint32_t pendSeq    = 0;
 volatile bool     capturing  = false;
+
+// ─────────────────────────────────────────────
+// 센서 프로파일
+// ─────────────────────────────────────────────
+
+// 공통: AEC 자동 제어 차단
+// AWB는 조명 모드별로 다르므로 여기서 건드리지 않음
+void applyCommonProfile(sensor_t* s) {
+  if (!s) return;
+
+  // AEC/AGC 수동 고정
+  s->set_exposure_ctrl(s, 0);
+  s->set_aec2(s, 0);
+  s->set_ae_level(s, 0);
+  s->set_gain_ctrl(s, 0);
+  s->set_gainceiling(s, GAINCEILING_4X);
+
+  s->set_raw_gma(s, 1);
+  s->set_lenc(s, 1);
+  s->set_bpc(s, 1);
+  s->set_wpc(s, 1);
+  s->set_dcw(s, 0);
+  s->set_special_effect(s, 0);
+}
+
+// UV(405nm) 형광 모드
+void applyUvProfile(sensor_t* s) {
+  if (!s) return;
+  applyCommonProfile(s);
+
+  s->set_whitebal(s, 0);      // UV는 AWB 끔
+  s->set_awb_gain(s, 0);
+  s->set_wb_mode(s, 0);
+
+  s->set_aec_value(s, g_uvAec);
+  s->set_agc_gain(s, g_uvAgc);
+
+  // OV3660 기본 분기의 saturation -2 / brightness +1을 덮어씀.
+  // 형광 촬영에는 정반대 방향임.
+  s->set_saturation(s, 2);
+  s->set_contrast(s, 1);
+  s->set_brightness(s, 0);
+}
+
+// 백색광 모드
+void applyWhiteProfile(sensor_t* s) {
+  if (!s) return;
+  applyCommonProfile(s);
+
+  s->set_whitebal(s, 1);      // 백색광은 AWB 켬
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 0);
+
+  s->set_aec_value(s, g_whiteAec);
+  s->set_agc_gain(s, g_whiteAgc);
+
+  s->set_saturation(s, 0);
+  s->set_contrast(s, 0);
+  s->set_brightness(s, 0);
+}
+
+void applyProfileFor(LedMode m) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (m == LED_UV) applyUvProfile(s);
+  else             applyWhiteProfile(s);
+}
 
 // ─────────────────────────────────────────────
 // LED 제어
@@ -79,9 +148,6 @@ void ledInit() {
   ledcAttach(PIN_W_LED,  PWM_FREQ, PWM_RES);
   ledcWrite(PIN_UV_LED, 0);
   ledcWrite(PIN_W_LED,  0);
-  // ESP32 core 2.x 라면:
-  //   ledcSetup(2, PWM_FREQ, PWM_RES); ledcAttachPin(PIN_UV_LED, 2);
-  //   ledcSetup(3, PWM_FREQ, PWM_RES); ledcAttachPin(PIN_W_LED,  3);
 }
 
 static inline int duty(int v) {
@@ -108,6 +174,9 @@ void setLed(LedMode m) {
       ledcWrite(PIN_UV_LED, duty(0));
       break;
   }
+  // 조명이 바뀌면 센서 프로파일도 함께 전환.
+  // 스트림 화면에서도 실제 촬영과 같은 노출로 보이게 하기 위함.
+  if (m != LED_OFF) applyProfileFor(m);
 }
 
 const char* ledName() {
@@ -168,11 +237,12 @@ String makeFilename(bool isUV) {
 
 // ─────────────────────────────────────────────
 // 조명 전환 후 안정화 캡처
-//   LED 바꾸면 AE/AWB가 따라오는 데 시간이 걸려서
-//   앞쪽 프레임은 버리고 마지막 것만 씀.
+//   프로파일 적용은 다음 프레임부터 반영되므로
+//   앞쪽 프레임을 버리고 마지막 것만 사용.
 // ─────────────────────────────────────────────
 camera_fb_t* captureWithLight(LedMode mode, int warmupMs = 350, int discard = 3) {
-  setLed(mode);
+  setLed(mode);              // 내부에서 프로파일도 함께 적용됨
+  applyProfileFor(mode);     // 명시적으로 한 번 더 (LED_OFF 경유 시 대비)
   delay(warmupMs);
 
   camera_fb_t* fb = nullptr;
@@ -220,7 +290,9 @@ void capturePair() {
     if (!fb) { Serial.println("[PAIR] capture failed"); ok = false; break; }
 
     String name = makeFilename(isUV);
-    if (storePending(i, fb, name)) Serial.printf("  [%d] %s  %u bytes\n", i, name.c_str(), fb->len);
+    if (storePending(i, fb, name))
+      Serial.printf("  [%d] %s  %u bytes  (aec=%d)\n", i, name.c_str(), fb->len,
+                    isUV ? g_uvAec : g_whiteAec);
     else ok = false;
 
     esp_camera_fb_return(fb);
@@ -237,8 +309,7 @@ void capturePair() {
 }
 
 // ─────────────────────────────────────────────
-// 스위치 처리 (액티브-로우, 디바운스)
-//   뗄 때 촬영 시작
+// 스위치 처리
 // ─────────────────────────────────────────────
 void swTask() {
   static bool     lastRaw  = HIGH;
@@ -382,12 +453,30 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
         <button class="u" onclick="led('uv')">UV</button>
         <button       onclick="led('off')">OFF</button>
       </div>
-      <label>백색 밝기 <span id="bw">200</span></label>
-      <input type="range" min="0" max="255" value="200"
-             oninput="bw.textContent=this.value" onchange="bright('w',this.value)">
-      <label>UV 밝기 <span id="bu">180</span></label>
-      <input type="range" min="0" max="255" value="180"
-             oninput="bu.textContent=this.value" onchange="bright('uv',this.value)">
+      <label>백색 밝기 <span id="bw">255</span></label>
+      <input type="range" min="0" max="255" value="255"
+            oninput="bw.textContent=this.value" onchange="bright('w',this.value)">
+      <label>UV 밝기 <span id="bu">255</span></label>
+      <input type="range" min="0" max="255" value="255"
+            oninput="bu.textContent=this.value" onchange="bright('uv',this.value)">
+    </div>
+
+    <div class="card">
+      <h2>노출 (수동 고정)</h2>
+      <label>UV 노출 aec <span id="ae">200</span></label>
+      <input id="aeR" type="range" min="0" max="1200" step="10" value="200"
+             oninput="ae.textContent=this.value" onchange="exp('aec',this.value)">
+      <label>백색 노출 waec <span id="wa">750</span></label>
+      <input id="waR" type="range" min="0" max="1200" step="10" value="750"
+            oninput="wa.textContent=this.value" onchange="exp('waec',this.value)">
+      <label>UV 게인 agc <span id="ag">4</span></label>
+      <input id="agR" type="range" min="0" max="30" value="4"
+             oninput="ag.textContent=this.value" onchange="exp('agc',this.value)">
+      <div class="hint">
+        조명 버튼을 누르면 해당 모드 노출이 스트림에 바로 적용됩니다.<br>
+        <b>흰 종이를 화면에 꽉 채우고</b> 백색 노출을 올려
+        회색이 아닌 흰색으로 보이는 값을 찾으세요.
+      </div>
     </div>
 
     <div class="card">
@@ -461,8 +550,20 @@ async function led(m){
   b.className = 'badge' + (s === 'WHITE' ? ' on-w' : s === 'UV' ? ' on-u' : '');
 }
 async function bright(k, v){ await fetch('/bright?' + k + '=' + v); }
+async function exp(k, v){ await fetch('/exp?' + k + '=' + v); log(k + ' = ' + v); }
 async function res(v){ await fetch('/res?v=' + v); log('해상도 변경'); }
 async function setView(){ await fetch('/view?v=' + view.value); log('구역: ' + view.value); }
+
+// 부팅 시 보드의 현재 노출값을 슬라이더에 반영
+async function loadExp(){
+  try{
+    const d = await (await fetch('/exp')).json();
+    aeR.value = d.aec;   ae.textContent = d.aec;
+    waR.value = d.waec;  wa.textContent = d.waec;
+    agR.value = d.agc;   ag.textContent = d.agc;
+  }catch(e){}
+}
+loadExp();
 
 function snap(l){
   log(l.toUpperCase() + ' 촬영 → 다운로드');
@@ -476,7 +577,6 @@ function pair(){
   setTimeout(() => snap('uv'), 1800);
 }
 
-// ── 스위치 촬영분 자동 수신 ────────────────────
 function grab(i){
   const a = document.createElement('a');
   a.href = '/pend?i=' + i + '&t=' + Date.now();
@@ -490,7 +590,7 @@ async function poll(){
     const r = await fetch('/pending');
     const d = await r.json();
 
-    if (lastSeq === null) { lastSeq = d.seq; }      // 첫 로드 시 과거분 무시
+    if (lastSeq === null) { lastSeq = d.seq; }
     else if (d.seq > lastSeq) {
       lastSeq = d.seq;
       log('스위치 촬영 수신: ' + d.w);
@@ -528,9 +628,42 @@ void handleBright() {
   server.send(200, "text/plain", "ok");
 }
 
+// 노출 조회 / 설정
+void handleExp() {
+  bool changed = false;
+
+  if (server.hasArg("aec")) {
+    g_uvAec = constrain(server.arg("aec").toInt(), 0, 1200);
+    changed = true;
+  }
+  if (server.hasArg("waec")) {
+    g_whiteAec = constrain(server.arg("waec").toInt(), 0, 1200);
+    changed = true;
+  }
+  if (server.hasArg("agc")) {
+    g_uvAgc = constrain(server.arg("agc").toInt(), 0, 30);
+    changed = true;
+  }
+
+  // 현재 켜져 있는 조명 모드에 즉시 반영 (스트림에서 바로 확인 가능)
+  if (changed && currentLed != LED_OFF) applyProfileFor(currentLed);
+
+  String j = "{";
+  j += "\"aec\":"   + String(g_uvAec);
+  j += ",\"waec\":" + String(g_whiteAec);
+  j += ",\"agc\":"  + String(g_uvAgc);
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
 void handleRes() {
   sensor_t* s = esp_camera_sensor_get();
-  if (s) s->set_framesize(s, (framesize_t)server.arg("v").toInt());
+  if (s) {
+    s->set_framesize(s, (framesize_t)server.arg("v").toInt());
+    delay(100);
+    // 해상도 변경 시 센서가 일부 설정을 되돌리므로 프로파일 재적용
+    applyProfileFor(currentLed == LED_UV ? LED_UV : LED_WHITE);
+  }
   server.send(200, "text/plain", "ok");
 }
 
@@ -539,7 +672,6 @@ void handleView() {
   server.send(200, "text/plain", VIEW_TYPE);
 }
 
-// 스위치 촬영분 상태 조회
 void handlePending() {
   String j = "{";
   j += "\"seq\":"  + String((unsigned long)pendSeq);
@@ -549,7 +681,6 @@ void handlePending() {
   server.send(200, "application/json", j);
 }
 
-// 스위치 촬영분 다운로드
 void handlePend() {
   int i = server.arg("i").toInt();
   if (i < 0 || i > 1 || !pendBuf[i] || pendLen[i] == 0) {
@@ -562,7 +693,6 @@ void handlePend() {
   server.client().write(pendBuf[i], pendLen[i]);
 }
 
-// 웹에서 즉시 촬영 → 다운로드
 void handleSnap() {
   if (server.hasArg("view")) VIEW_TYPE = server.arg("view");
   bool isUV = (server.arg("light") == "uv");
@@ -582,7 +712,8 @@ void handleSnap() {
   }
 
   String fname = makeFilename(isUV);
-  Serial.printf("[SNAP] %s  %u bytes\n", fname.c_str(), fb->len);
+  Serial.printf("[SNAP] %s  %u bytes  (aec=%d)\n", fname.c_str(), fb->len,
+                isUV ? g_uvAec : g_whiteAec);
 
   server.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
   server.setContentLength(fb->len);
@@ -592,6 +723,29 @@ void handleSnap() {
   esp_camera_fb_return(fb);
   setLed(prev);
   xSemaphoreGive(camMutex);
+}
+
+void printStatus() {
+  sensor_t* s = esp_camera_sensor_get();
+  Serial.println("── 상태 ───────────────────────────────");
+  if (s) Serial.printf("  PID       : 0x%x\n", s->id.PID);
+  Serial.printf("  조명      : %s\n", ledName());
+  Serial.printf("  viewType  : %s\n", VIEW_TYPE.c_str());
+  Serial.printf("  UV        : aec=%d  agc=%d  밝기=%d\n", g_uvAec, g_uvAgc, brightUV);
+  Serial.printf("  백색광    : aec=%d  agc=%d  밝기=%d\n", g_whiteAec, g_whiteAgc, brightW);
+  Serial.println("───────────────────────────────────────");
+}
+
+void printHelp() {
+  Serial.println("── 시리얼 명령 ────────────────────────");
+  Serial.println("  w / u / o      백색 / UV / 끄기");
+  Serial.println("  c              백색+UV 연속 촬영");
+  Serial.println("  sw             스위치 상태");
+  Serial.println("  aec <0-1200>   UV 노출");
+  Serial.println("  waec <0-1200>  백색광 노출");
+  Serial.println("  agc <0-30>     UV 게인");
+  Serial.println("  status / help");
+  Serial.println("───────────────────────────────────────");
 }
 
 // ─────────────────────────────────────────────
@@ -604,7 +758,6 @@ void setup() {
   setLed(LED_OFF);
   pinMode(PIN_SW, INPUT_PULLUP);
 
-  // ── 카메라 ──────────────────────────────────
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -644,31 +797,30 @@ void setup() {
   }
 
   sensor_t* s = esp_camera_sensor_get();
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);
-    s->set_brightness(s, 1);
-    s->set_saturation(s, -2);
-  }
   s->set_framesize(s, FRAMESIZE_VGA);
   s->set_vflip(s, 0);
-  s->set_hmirror(s, 0);        // 거울처럼 보고 싶으면 1
+  s->set_hmirror(s, 0);
+
+  // 기존 OV3660 분기(saturation -2, brightness +1)는 제거함.
+  // 형광 촬영에 불리하고, 아래 프로파일에서 조명별로 다시 지정함.
+  applyWhiteProfile(s);
 
   camMutex = xSemaphoreCreateMutex();
 
   connectWiFi();
 
-  // ── 연결 성공 알림: 백색 3초 ────────────────
   if (WiFi.status() == WL_CONNECTED) {
     setLed(LED_WHITE);
     delay(3000);
     setLed(LED_OFF);
   }
 
-  configTime(9 * 3600, 0, "pool.ntp.org", "time.google.com");   // KST
+  configTime(9 * 3600, 0, "pool.ntp.org", "time.google.com");
 
   server.on("/",        handleRoot);
   server.on("/led",     handleLed);
   server.on("/bright",  handleBright);
+  server.on("/exp",     handleExp);
   server.on("/res",     handleRes);
   server.on("/view",    handleView);
   server.on("/snap",    handleSnap);
@@ -681,9 +833,9 @@ void setup() {
   Serial.println("========================================");
   Serial.print  ("  UI     : http://"); Serial.println(WiFi.localIP());
   Serial.print  ("  Stream : http://"); Serial.print(WiFi.localIP()); Serial.println(":81/stream");
-  Serial.println("  Serial : w / u / o / c(연속촬영) / sw(스위치상태)");
-  Serial.println("  스위치 : 누르면 백색 + UV 연속 촬영");
   Serial.println("========================================");
+  printHelp();
+  printStatus();
 }
 
 void loop() {
@@ -693,6 +845,7 @@ void loop() {
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
+
     if      (cmd == "w")  { setLed(LED_WHITE); Serial.println("WHITE"); }
     else if (cmd == "u")  { setLed(LED_UV);    Serial.println("UV"); }
     else if (cmd == "o")  { setLed(LED_OFF);   Serial.println("OFF"); }
@@ -701,6 +854,24 @@ void loop() {
       Serial.printf("[SW] GPIO%d = %s\n", PIN_SW,
                     digitalRead(PIN_SW) == LOW ? "LOW (눌림)" : "HIGH (뗌)");
     }
+    else if (cmd.startsWith("aec ")) {
+      g_uvAec = constrain(cmd.substring(4).toInt(), 0, 1200);
+      if (currentLed != LED_OFF) applyProfileFor(currentLed);
+      Serial.printf("[SET] uv aec = %d\n", g_uvAec);
+    }
+    else if (cmd.startsWith("waec ")) {
+      g_whiteAec = constrain(cmd.substring(5).toInt(), 0, 1200);
+      if (currentLed != LED_OFF) applyProfileFor(currentLed);
+      Serial.printf("[SET] white aec = %d\n", g_whiteAec);
+    }
+    else if (cmd.startsWith("agc ")) {
+      g_uvAgc = constrain(cmd.substring(4).toInt(), 0, 30);
+      if (currentLed != LED_OFF) applyProfileFor(currentLed);
+      Serial.printf("[SET] uv agc = %d\n", g_uvAgc);
+    }
+    else if (cmd == "status") { printStatus(); }
+    else if (cmd == "help")   { printHelp(); }
+    else if (cmd.length())    { Serial.println("[ERR] 알 수 없는 명령. 'help'"); }
   }
   delay(2);
 }
