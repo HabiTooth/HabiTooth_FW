@@ -65,8 +65,23 @@ WebServer      server(80);
 WiFiServer     streamServer(81);
 SemaphoreHandle_t camMutex;
 
-enum LedMode { LED_OFF = 0, LED_WHITE, LED_UV };
-LedMode currentLed = LED_OFF;
+enum LedMode { LED_OFF = 0, LED_WHITE, LED_UV, LED_PREVIEW };
+LedMode currentLed = LED_OFF;   
+
+// ── 프리뷰(상시) 조명 ─────────────────────────
+//  촬영용이 아니라 '보이게 하는' 용도.
+//  밝기를 낮추고 노출로 보상해서 발열을 줄인다.
+int g_previewBright = 60;
+int g_previewAec    = 750;
+int g_previewAgc    = 0;    // 950/12에서 변경 — 게인은 노이즈만 늘리니 필요할 때만
+
+volatile int streamClients = 0;
+uint32_t previewSince    = 0;
+uint32_t previewCoolUntil = 0;
+
+#define PREVIEW_MAX_MS   180000UL   // 연속 점등 상한 3분
+#define PREVIEW_COOL_MS   30000UL   // 강제 소등 후 쿨다운 30초
+#define WHITE_MAX_MS      60000UL   // 풀출력 백색광 수동 점등 상한 1분
 
 uint8_t*          pendBuf[2] = { nullptr, nullptr };
 size_t            pendLen[2] = { 0, 0 };
@@ -103,16 +118,17 @@ void applyUvProfile(sensor_t* s) {
   if (!s) return;
   applyCommonProfile(s);
 
-  s->set_whitebal(s, 0);      // UV는 AWB 끔
-  s->set_awb_gain(s, 0);
-  s->set_wb_mode(s, 0);
+  // OV5640은 AWB를 끄면 중립이 아니라 G 편중 원본 상태가 됨.
+  // 노란 필터까지 겹치면 전체가 연두~노랑으로 물듦.
+  // auto가 아닌 '고정 프리셋'으로 잠가서 매번 같은 색을 얻는다.
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 1);   // 0=auto 1=sunny 2=cloudy 3=office 4=home
 
   s->set_aec_value(s, g_uvAec);
   s->set_agc_gain(s, g_uvAgc);
 
-  // OV3660 기본 분기의 saturation -2 / brightness +1을 덮어씀.
-  // 형광 촬영에는 정반대 방향임.
-  s->set_saturation(s, 2);
+  s->set_saturation(s, 0);   // 2는 노란 캐스트를 그대로 증폭함
   s->set_contrast(s, 1);
   s->set_brightness(s, 0);
 }
@@ -134,10 +150,26 @@ void applyWhiteProfile(sensor_t* s) {
   s->set_brightness(s, 0);
 }
 
+// 프리뷰 전용: 저조도 + 고노출.
+// 데이터셋 이미지는 여기를 거치지 않는다.
+void applyPreviewProfile(sensor_t* s) {
+  if (!s) return;
+  applyCommonProfile(s);
+  s->set_whitebal(s, 1);
+  s->set_awb_gain(s, 1);
+  s->set_wb_mode(s, 0);
+  s->set_aec_value(s, g_previewAec);
+  s->set_agc_gain(s, g_previewAgc);
+  s->set_saturation(s, 0);
+  s->set_contrast(s, 0);
+  s->set_brightness(s, 0);
+}
+
 void applyProfileFor(LedMode m) {
   sensor_t* s = esp_camera_sensor_get();
-  if (m == LED_UV) applyUvProfile(s);
-  else             applyWhiteProfile(s);
+  if      (m == LED_UV)      applyUvProfile(s);
+  else if (m == LED_PREVIEW) applyPreviewProfile(s);
+  else                       applyWhiteProfile(s);
 }
 
 // ─────────────────────────────────────────────
@@ -165,6 +197,10 @@ void setLed(LedMode m) {
       ledcWrite(PIN_UV_LED, duty(0));
       ledcWrite(PIN_W_LED,  duty(brightW));
       break;
+    case LED_PREVIEW:
+      ledcWrite(PIN_UV_LED, duty(0));
+      ledcWrite(PIN_W_LED,  duty(g_previewBright));
+      break;
     case LED_UV:
       ledcWrite(PIN_W_LED,  duty(0));
       ledcWrite(PIN_UV_LED, duty(brightUV));
@@ -174,13 +210,17 @@ void setLed(LedMode m) {
       ledcWrite(PIN_UV_LED, duty(0));
       break;
   }
-  // 조명이 바뀌면 센서 프로파일도 함께 전환.
-  // 스트림 화면에서도 실제 촬영과 같은 노출로 보이게 하기 위함.
-  if (m != LED_OFF) applyProfileFor(m);
+  if (m == LED_WHITE || m == LED_PREVIEW) previewSince = millis();
+  applyProfileFor(m == LED_OFF ? LED_WHITE : m);
 }
 
 const char* ledName() {
-  return currentLed == LED_WHITE ? "WHITE" : (currentLed == LED_UV ? "UV" : "OFF");
+  switch (currentLed) {
+    case LED_WHITE:   return "WHITE";
+    case LED_UV:      return "UV";
+    case LED_PREVIEW: return "PREVIEW";
+    default:          return "OFF";
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -339,6 +379,7 @@ void streamTask(void* pv) {
     if (!client) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
 
     Serial.println("[STREAM] connected");
+    streamClients++;
     client.print(
       "HTTP/1.1 200 OK\r\n"
       "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
@@ -360,6 +401,7 @@ void streamTask(void* pv) {
     }
 
     client.stop();
+    streamClients--;
     Serial.println("[STREAM] disconnected");
   }
 }
@@ -617,7 +659,10 @@ void handleLed() {
   String m = server.arg("mode");
   if      (m == "white") setLed(LED_WHITE);
   else if (m == "uv")    setLed(LED_UV);
-  else                   setLed(LED_OFF);
+  else {
+    setLed(LED_OFF);
+    previewCoolUntil = millis() + PREVIEW_COOL_MS;  // 30초간 자동 점등 억제
+  }
   server.send(200, "text/plain", ledName());
 }
 
@@ -662,7 +707,7 @@ void handleRes() {
     s->set_framesize(s, (framesize_t)server.arg("v").toInt());
     delay(100);
     // 해상도 변경 시 센서가 일부 설정을 되돌리므로 프로파일 재적용
-    applyProfileFor(currentLed == LED_UV ? LED_UV : LED_WHITE);
+    applyProfileFor(currentLed);
   }
   server.send(200, "text/plain", "ok");
 }
@@ -725,6 +770,19 @@ void handleSnap() {
   xSemaphoreGive(camMutex);
 }
 
+void handlePreview() {
+  bool changed = false;
+  if (server.hasArg("b"))   { g_previewBright = constrain(server.arg("b").toInt(), 0, 255);   changed = true; }
+  if (server.hasArg("aec")) { g_previewAec    = constrain(server.arg("aec").toInt(), 0, 1200); changed = true; }
+  if (server.hasArg("agc")) { g_previewAgc    = constrain(server.arg("agc").toInt(), 0, 30);   changed = true; }
+  if (changed && currentLed == LED_PREVIEW) setLed(LED_PREVIEW);
+
+  String j = "{\"b\":" + String(g_previewBright) +
+             ",\"aec\":" + String(g_previewAec) +
+             ",\"agc\":" + String(g_previewAgc) + "}";
+  server.send(200, "application/json", j);
+}
+
 void printStatus() {
   sensor_t* s = esp_camera_sensor_get();
   Serial.println("── 상태 ───────────────────────────────");
@@ -757,6 +815,7 @@ void setup() {
   ledInit();
   setLed(LED_OFF);
   pinMode(PIN_SW, INPUT_PULLUP);
+  
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -826,6 +885,7 @@ void setup() {
   server.on("/snap",    handleSnap);
   server.on("/pending", handlePending);
   server.on("/pend",    handlePend);
+  server.on("/preview", handlePreview);
   server.begin();
 
   xTaskCreatePinnedToCore(streamTask, "stream", 8192, NULL, 1, NULL, 0);
@@ -838,9 +898,39 @@ void setup() {
   printStatus();
 }
 
+void ledGuardTask() {
+  if (capturing) return;
+
+  uint32_t now = millis();
+
+  // 연속 점등 상한
+  if (currentLed == LED_PREVIEW && (now - previewSince) > PREVIEW_MAX_MS) {
+    setLed(LED_OFF);
+    previewCoolUntil = now + PREVIEW_COOL_MS;
+    Serial.println("[LED] 프리뷰 연속 점등 상한 - 강제 소등");
+    return;
+  }
+  if (currentLed == LED_WHITE && (now - previewSince) > WHITE_MAX_MS) {
+    setLed(LED_OFF);
+    previewCoolUntil = now + PREVIEW_COOL_MS;
+    Serial.println("[LED] 백색 풀출력 상한 - 강제 소등");
+    return;
+  }
+
+  bool want = (streamClients > 0);
+
+  if (want && currentLed == LED_OFF && now >= previewCoolUntil) {
+    setLed(LED_PREVIEW);
+  } else if (!want && currentLed == LED_PREVIEW) {
+    setLed(LED_OFF);   // 아무도 안 보면 끈다
+  }
+}
+
 void loop() {
   server.handleClient();
   swTask();
+
+  ledGuardTask();
 
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
