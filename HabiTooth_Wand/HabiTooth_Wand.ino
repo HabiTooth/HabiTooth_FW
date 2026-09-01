@@ -25,21 +25,17 @@
  *   누르면 백색 -> UV 연속 촬영. 두 장 모두 브라우저로 자동 다운로드.
  *
  * ===== 접속 =====
- *   UI     : http://<보드IP>/   또는  http://habitooth.local/
+ *   UI     : http://<보드IP>/
  *   스트림 : http://<보드IP>:81/stream
- *
- *   핫스팟은 접속할 때마다 IP가 바뀌므로, 부팅 후 아무 명령도 입력하지 않으면
- *   시리얼에 주소 배너를 5초마다 다시 찍는다. 아무 키나 입력하면 멈춘다.
- *   나중에 다시 보려면 'ip' 입력.
  */
 
 #include <Arduino.h>
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WebServer.h>
-#include <ESPmDNS.h>
 #include <time.h>
 #include <Adafruit_NeoPixel.h>
+#include <ESPmDNS.h>
 
 #include "board_config.h"
 #include "config.h"
@@ -54,32 +50,23 @@
 
 #define LED_ACTIVE_HIGH  1
 
-#define PWM_FREQ   40000
-#define PWM_RES    8
-
-// 카메라 XCLK가 LEDC_CHANNEL_0 / LEDC_TIMER_0을 쓰므로
-// LED PWM 채널을 4, 5로 명시해서 충돌을 피한다.
-// (ledcAttach 자동 할당은 채널 0부터 가져가서 XCLK를 깰 수 있음)
 #define LEDC_CH_UV   4
 #define LEDC_CH_W    5
 
+#define PWM_FREQ   40000
+#define PWM_RES    8
 int brightW  = 255;
 int brightUV = 255;
 
 #define DEBOUNCE_MS  30
+#define MDNS_NAME  "habitooth"
 
 // ── 노출 설정 (OV3660: aec 0~1200, agc 0~30) ──
-int g_uvAec    = 200;
+int g_uvAec    = 600;
 int g_uvAgc    = 4;
+int g_uvWb = 1;
 int g_whiteAec = 750;    // 노란 필터 기준으로 맞춘 값
 int g_whiteAgc = 0;
-
-// ── 네트워크 ──────────────────────────────────
-#define MDNS_NAME    "habitooth"
-#define BANNER_MS    5000UL
-
-uint32_t bannerLast = 0;
-bool     bannerDone = false;
 
 // ── 촬영 구역 ─────────────────────────────────
 String VIEW_TYPE = "OUTER_CENTER";
@@ -92,10 +79,7 @@ SemaphoreHandle_t camMutex;
 Adafruit_NeoPixel strip(NUM_PIXELS, PIN_NEO, NEO_GRB + NEO_KHZ800);
 
 enum LedMode { LED_OFF = 0, LED_WHITE, LED_UV, LED_PREVIEW };
-
 LedMode currentLed = LED_OFF;
-
-bool previewAuto = true;
 
 // ── 프리뷰(상시) 조명 ─────────────────────────
 int g_previewBright = 60;
@@ -152,7 +136,7 @@ void applyUvProfile(sensor_t* s) {
   applyCommonProfile(s);
   s->set_whitebal(s, 1);
   s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, 1);   // 0=auto 1=sunny 2=cloudy 3=office 4=home
+  s->set_wb_mode(s, g_uvWb);   // 0=auto 1=sunny 2=cloudy 3=office 4=home
   s->set_aec_value(s, g_uvAec);
   s->set_agc_gain(s, g_uvAgc);
   s->set_saturation(s, 0);
@@ -211,6 +195,18 @@ static inline int duty(int v) {
 #endif
 }
 
+static inline void driveLed(int pin, int v) {
+  if (v >= 255) {                 // 풀출력이면 PWM 끄고 DC로
+    ledcDetach(pin);
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, HIGH);
+  } else if (v <= 0) {
+    ledcWrite(pin, duty(0));
+  } else {
+    ledcWrite(pin, duty(v));
+  }
+}
+
 void setLed(LedMode m) {
   currentLed = m;
   switch (m) {
@@ -245,23 +241,6 @@ const char* ledName() {
 }
 
 // ─────────────────────────────────────────────
-// 접속 주소 배너
-// ─────────────────────────────────────────────
-void printBanner() {
-  Serial.println("========================================");
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("  SSID   : %s  (RSSI %d)\n", WiFi.SSID().c_str(), WiFi.RSSI());
-    Serial.print ("  UI     : http://"); Serial.println(WiFi.localIP());
-    Serial.printf("           http://%s.local/\n", MDNS_NAME);
-    Serial.print ("  Stream : http://"); Serial.print(WiFi.localIP());
-    Serial.println(":81/stream");
-  } else {
-    Serial.println("  WiFi   : 미연결");
-  }
-  Serial.println("========================================");
-}
-
-// ─────────────────────────────────────────────
 // WiFi - 핫스팟 4개 순차 시도
 // ─────────────────────────────────────────────
 void connectWiFi() {
@@ -290,13 +269,10 @@ void connectWiFi() {
     }
     if (WiFi.status() == WL_CONNECTED) {
       Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
-
-      // 핫스팟은 IP가 매번 바뀌므로 고정 주소를 하나 만들어 둔다
       if (MDNS.begin(MDNS_NAME)) {
         MDNS.addService("http", "tcp", 80);
         Serial.printf("mDNS: http://%s.local/\n", MDNS_NAME);
       }
-
       neoOk();
       delay(1500);
       neoOff();
@@ -578,23 +554,19 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
       <label>촬영 구역 (viewType)</label>
       <select id="view" onchange="setView()">
         <optgroup label="설측 상악">
-          <option value="UPPER_RIGHT_MOLAR">UPPER_RIGHT_MOLAR 상악 우 대구치</option>
-          <option value="UPPER_RIGHT_PREMOLAR">UPPER_RIGHT_PREMOLAR 상악 우 소구치</option>
-          <option value="UPPER_FRONT">UPPER_FRONT 상악 전치부</option>
-          <option value="UPPER_LEFT_PREMOLAR">UPPER_LEFT_PREMOLAR 상악 좌 소구치</option>
-          <option value="UPPER_LEFT_MOLAR">UPPER_LEFT_MOLAR 상악 좌 대구치</option>
+          <option value="UPPER_LEFT">UPPER_LEFT 상악 좌</option>
+          <option value="UPPER_CENTER">UPPER_CENTER 상악 중앙</option>
+          <option value="UPPER_RIGHT">UPPER_RIGHT 상악 우</option>
         </optgroup>
         <optgroup label="설측 하악">
-          <option value="LOWER_RIGHT_MOLAR">LOWER_RIGHT_MOLAR 하악 우 대구치</option>
-          <option value="LOWER_RIGHT_PREMOLAR">LOWER_RIGHT_PREMOLAR 하악 우 소구치</option>
-          <option value="LOWER_FRONT">LOWER_FRONT 하악 전치부</option>
-          <option value="LOWER_LEFT_PREMOLAR">LOWER_LEFT_PREMOLAR 하악 좌 소구치</option>
-          <option value="LOWER_LEFT_MOLAR">LOWER_LEFT_MOLAR 하악 좌 대구치</option>
+          <option value="LOWER_LEFT">LOWER_LEFT 하악 좌</option>
+          <option value="LOWER_CENTER">LOWER_CENTER 하악 중앙</option>
+          <option value="LOWER_RIGHT">LOWER_RIGHT 하악 우</option>
         </optgroup>
         <optgroup label="외측">
-          <option value="OUTER_RIGHT">OUTER_RIGHT 외측 우</option>
-          <option value="OUTER_CENTER" selected>OUTER_CENTER 외측 중앙</option>
           <option value="OUTER_LEFT">OUTER_LEFT 외측 좌</option>
+          <option value="OUTER_CENTER" selected>OUTER_CENTER 외측 중앙</option>
+          <option value="OUTER_RIGHT">OUTER_RIGHT 외측 우</option>
         </optgroup>
       </select>
       <label>해상도</label>
@@ -723,9 +695,12 @@ void handleRoot() {
 
 void handleLed() {
   String m = server.arg("mode");
-  if      (m == "white") { previewAuto = true; setLed(LED_WHITE); }
-  else if (m == "uv")    { previewAuto = true; setLed(LED_UV); }
-  else                   { previewAuto = false; setLed(LED_OFF); }
+  if      (m == "white") setLed(LED_WHITE);
+  else if (m == "uv")    setLed(LED_UV);
+  else {
+    setLed(LED_OFF);
+    previewCoolUntil = millis() + PREVIEW_COOL_MS;
+  }
   server.send(200, "text/plain", ledName());
 }
 
@@ -862,13 +837,6 @@ void printStatus() {
   sensor_t* s = esp_camera_sensor_get();
   Serial.println("── 상태 ───────────────────────────────");
   if (s) Serial.printf("  PID       : 0x%x\n", s->id.PID);
-  Serial.printf("  WiFi      : %s  %s  RSSI=%d\n",
-                WiFi.status() == WL_CONNECTED ? WiFi.SSID().c_str() : "미연결",
-                WiFi.localIP().toString().c_str(), WiFi.RSSI());
-  Serial.printf("  UI        : http://%s/  또는  http://%s.local/\n",
-                WiFi.localIP().toString().c_str(), MDNS_NAME);
-  Serial.printf("  핀맵      : UV=GPIO%d  W=GPIO%d  NEO=GPIO%d  SW=GPIO%d\n",
-                PIN_UV_LED, PIN_W_LED, PIN_NEO, PIN_SW);
   Serial.printf("  조명      : %s\n", ledName());
   Serial.printf("  viewType  : %s\n", VIEW_TYPE.c_str());
   Serial.printf("  UV        : aec=%d  agc=%d  밝기=%d\n", g_uvAec, g_uvAgc, brightUV);
@@ -881,10 +849,11 @@ void printHelp() {
   Serial.println("  w / u / o      백색 / UV / 끄기");
   Serial.println("  c              백색+UV 연속 촬영");
   Serial.println("  sw             스위치 상태");
-  Serial.println("  ip             접속 주소 다시 표시");
   Serial.println("  aec <0-1200>   UV 노출");
   Serial.println("  waec <0-1200>  백색광 노출");
   Serial.println("  agc <0-30>     UV 게인");
+  Serial.println("  wb <0-4>       UV 화이트밸런스 (0auto 1sunny 2cloudy 3office 4home)");
+  Serial.println("  bw <0-255>     백색 밝기    bu <0-255>  UV 밝기");
   Serial.println("  n              네오픽셀 색상 순환 (테스트)");
   Serial.println("  no             네오픽셀 OFF");
   Serial.println("  status / help");
@@ -894,13 +863,8 @@ void printHelp() {
 // ─────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  // ESP32-S3 네이티브 USB는 모니터를 열어도 보드가 리셋되지 않는다.
-  // 포트가 열릴 때까지 최대 5초 기다려서 setup 출력을 놓치지 않게 한다.
-  // (배터리 단독 구동 시에는 5초 후 그냥 진행)
-  uint32_t tSer = millis();
-  while (!Serial && (millis() - tSer) < 5000) delay(10);
-  delay(300);
   Serial.setDebugOutput(false);
+  delay(800);
 
   ledInit();
   setLed(LED_OFF);
@@ -981,15 +945,17 @@ void setup() {
   server.on("/pend",    handlePend);
   server.on("/preview", handlePreview);
   server.on("/neo",     handleNeo);
+  server.enableCORS(true);
   server.begin();
 
   xTaskCreatePinnedToCore(streamTask, "stream", 8192, NULL, 1, NULL, 0);
 
-  printBanner();
+  Serial.println("========================================");
+  Serial.print  ("  UI     : http://"); Serial.println(WiFi.localIP());
+  Serial.print  ("  Stream : http://"); Serial.print(WiFi.localIP()); Serial.println(":81/stream");
+  Serial.println("========================================");
   printHelp();
   printStatus();
-
-  bannerLast = millis();   // 이후 5초마다 배너 반복 (입력이 있을 때까지)
 }
 
 void ledGuardTask() {
@@ -1010,7 +976,7 @@ void ledGuardTask() {
     return;
   }
 
-  bool want = (streamClients > 0) && previewAuto;
+  bool want = (streamClients > 0);
 
   if (want && currentLed == LED_OFF && now >= previewCoolUntil) {
     setLed(LED_PREVIEW);
@@ -1019,32 +985,20 @@ void ledGuardTask() {
   }
 }
 
-// 모니터를 늦게 열어도 접속 주소를 볼 수 있게 배너를 반복 출력.
-// 시리얼 입력이 한 번이라도 들어오면 멈춘다.
-void bannerTask() {
-  if (bannerDone || capturing) return;
-  if (millis() - bannerLast < BANNER_MS) return;
-  bannerLast = millis();
-  printBanner();
-}
-
 void loop() {
   server.handleClient();
   swTask();
 
   ledGuardTask();
-  bannerTask();
 
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
-    bannerDone = true;   // 사람이 보고 있다는 뜻이니 배너 중단
 
-    if      (cmd == "w")  { previewAuto = true;  setLed(LED_WHITE); Serial.println("WHITE"); }
-    else if (cmd == "u")  { previewAuto = true;  setLed(LED_UV);    Serial.println("UV"); }
-    else if (cmd == "o")  { previewAuto = false; setLed(LED_OFF);   Serial.println("OFF (자동점등 해제)"); }
+    if      (cmd == "w")  { setLed(LED_WHITE); Serial.println("WHITE"); }
+    else if (cmd == "u")  { setLed(LED_UV);    Serial.println("UV"); }
+    else if (cmd == "o")  { setLed(LED_OFF);   Serial.println("OFF"); }
     else if (cmd == "c")  { capturePair(); }
-    else if (cmd == "ip") { printBanner(); }
     else if (cmd == "n")  {
       static int idx = 0;
       const uint32_t seq[] = {
@@ -1074,6 +1028,22 @@ void loop() {
       g_uvAgc = constrain(cmd.substring(4).toInt(), 0, 30);
       if (currentLed != LED_OFF) applyProfileFor(currentLed);
       Serial.printf("[SET] uv agc = %d\n", g_uvAgc);
+    }
+    else if (cmd.startsWith("wb ")) {
+      g_uvWb = constrain(cmd.substring(3).toInt(), 0, 4);
+      if (currentLed != LED_OFF) applyProfileFor(currentLed);
+      const char* n[] = {"auto","sunny","cloudy","office","home"};
+      Serial.printf("[SET] uv wb = %d (%s)\n", g_uvWb, n[g_uvWb]);
+    }
+    else if (cmd.startsWith("bw ")) {
+      brightW = constrain(cmd.substring(3).toInt(), 0, 255);
+      setLed(currentLed);
+      Serial.printf("[SET] white bright = %d\n", brightW);
+    }
+    else if (cmd.startsWith("bu ")) {
+      brightUV = constrain(cmd.substring(3).toInt(), 0, 255);
+      setLed(currentLed);
+      Serial.printf("[SET] uv bright = %d\n", brightUV);
     }
     else if (cmd == "status") { printStatus(); }
     else if (cmd == "help")   { printHelp(); }
