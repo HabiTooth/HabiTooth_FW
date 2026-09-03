@@ -1,5 +1,6 @@
 /*
  * HabiTooth Wand - Camera Web Server + White/UV LED + NeoPixel
+ * 구형 + 100미리 카메라 가로줄 제거용
  * Board: Seeed XIAO ESP32S3 Sense
  *
  * ===== 핀맵 (2026-09 신 회로 - 확정본) =====
@@ -27,6 +28,8 @@
  * ===== 접속 =====
  *   UI     : http://habitooth.local/
  *   스트림 : http://habitooth.local:81/stream
+ *
+ * 결과: 
  */
 
 #include <Arduino.h>
@@ -39,6 +42,7 @@
 
 #include "board_config.h"
 #include "config.h"
+#include "img_converters.h"
 
 // ── LED / 스위치 / 네오픽셀 핀 (신 회로) ─────
 #define PIN_UV_LED   4    // D3
@@ -93,7 +97,7 @@ uint32_t previewCoolUntil = 0;
 #define PREVIEW_MAX_MS   180000UL
 #define PREVIEW_COOL_MS   30000UL
 #define WHITE_MAX_MS      60000UL
-#define PEND_CAP  (150 * 1024)
+#define PEND_CAP  (220 * 1024)
 
 uint8_t*          pendBuf[2] = { nullptr, nullptr };
 size_t            pendCap[2] = { 0, 0 };
@@ -136,13 +140,12 @@ void applyCommonProfile(sensor_t* s) {
 void applyUvProfile(sensor_t* s) {
   if (!s) return;
   applyCommonProfile(s);
-  s->set_whitebal(s, 1);
-  s->set_awb_gain(s, 1);
-  s->set_wb_mode(s, g_uvWb);   // 0=auto 1=sunny 2=cloudy 3=office 4=home
+  s->set_whitebal(s, 0);        // AWB 끔 - R 게인 폭주 차단
+  s->set_awb_gain(s, 0);
   s->set_aec_value(s, g_uvAec);
-  s->set_agc_gain(s, g_uvAgc);
+  s->set_agc_gain(s, 0);        // 4 → 0
   s->set_saturation(s, 0);
-  s->set_contrast(s, 1);
+  s->set_contrast(s, 0);        // 1 → 0
   s->set_brightness(s, 0);
 }
 
@@ -322,18 +325,75 @@ camera_fb_t* captureWithLight(LedMode mode, int warmupMs = 350, int discard = 3)
 }
 
 // ─────────────────────────────────────────────
+// N장 평균 촬영 (랜덤 행 노이즈 억제). N은 8 이하
+// 성공 시 *outJpg 를 호출자가 free() 해야 함
+// ─────────────────────────────────────────────
+bool captureAveraged(LedMode mode, int N, uint8_t** outJpg, size_t* outLen) {
+  setLed(mode);
+  applyProfileFor(mode);
+  delay(400);
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t* f = esp_camera_fb_get();
+    if (f) esp_camera_fb_return(f);
+  }
+
+  int W = 0, H = 0, cnt = 0;
+  uint16_t* acc = nullptr;
+  uint8_t*  rgb = nullptr;
+  bool ok = false;
+
+  for (int i = 0; i < N; i++) {
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (!fb) continue;
+    if (!acc) {
+      W = fb->width; H = fb->height;
+      size_t n = (size_t)W * H * 3;
+      acc = (uint16_t*)ps_calloc(n, sizeof(uint16_t));
+      rgb = (uint8_t*)ps_malloc(n);
+      if (!acc || !rgb) {
+        Serial.println("[AVG] PSRAM 할당 실패");
+        esp_camera_fb_return(fb);
+        break;
+      }
+    }
+    if (fmt2rgb888(fb->buf, fb->len, fb->format, rgb)) {
+      size_t n = (size_t)W * H * 3;
+      for (size_t k = 0; k < n; k++) acc[k] += rgb[k];
+      cnt++;
+    }
+    esp_camera_fb_return(fb);
+  }
+
+  if (cnt > 0 && acc && rgb) {
+    size_t n = (size_t)W * H * 3;
+    for (size_t k = 0; k < n; k++) rgb[k] = (uint8_t)(acc[k] / cnt);
+    ok = fmt2jpg(rgb, n, W, H, PIXFORMAT_RGB888, 90, outJpg, outLen);
+    Serial.printf("[AVG] %d장 평균 → %u bytes\n", cnt, (unsigned)(ok ? *outLen : 0));
+  }
+
+  if (acc) free(acc);
+  if (rgb) free(rgb);
+  return ok;
+}
+
+// ─────────────────────────────────────────────
 // 스위치 촬영: 백색 + UV
 // ─────────────────────────────────────────────
-bool storePending(int idx, camera_fb_t* fb, const String& name) {
+bool storePendingRaw(int idx, const uint8_t* buf, size_t len, const String& name) {
   if (!pendBuf[idx]) { Serial.println("[ERR] pending buffer 미할당"); return false; }
-  if (fb->len > pendCap[idx]) {
-    Serial.printf("[ERR] 이미지가 버퍼보다 큼 %u > %u\n", fb->len, pendCap[idx]);
+  if (len > pendCap[idx]) {
+    Serial.printf("[ERR] 이미지가 버퍼보다 큼 %u > %u\n",
+                  (unsigned)len, (unsigned)pendCap[idx]);
     return false;
   }
-  memcpy(pendBuf[idx], fb->buf, fb->len);
-  pendLen[idx]  = fb->len;
+  memcpy(pendBuf[idx], buf, len);
+  pendLen[idx]  = len;
   pendName[idx] = name;
   return true;
+}
+
+bool storePending(int idx, camera_fb_t* fb, const String& name) {
+  return storePendingRaw(idx, fb->buf, fb->len, name);
 }
 
 void capturePair() {
@@ -352,17 +412,30 @@ void capturePair() {
   for (int i = 0; i < 2; i++) {
     bool isUV = (i == 1);
     if (isUV) neoFlashUV(); else neoFlashW();
-
-    camera_fb_t* fb = captureWithLight(isUV ? LED_UV : LED_WHITE);
-    if (!fb) { Serial.println("[PAIR] capture failed"); ok = false; break; }
-
     String name = makeFilename(isUV);
-    if (storePending(i, fb, name))
-      Serial.printf("  [%d] %s  %u bytes  (aec=%d)\n", i, name.c_str(), fb->len,
-                    isUV ? g_uvAec : g_whiteAec);
-    else { ok = false; esp_camera_fb_return(fb); break; }
 
-    esp_camera_fb_return(fb);
+    if (isUV) {
+      uint8_t* jpg = nullptr;
+      size_t   len = 0;
+      if (!captureAveraged(LED_UV, 8, &jpg, &len)) {
+        Serial.println("[PAIR] UV 평균 촬영 실패");
+        ok = false;
+        break;
+      }
+      bool stored = storePendingRaw(i, jpg, len, name);
+      free(jpg);
+      if (!stored) { ok = false; break; }
+      Serial.printf("  [%d] %s  %u bytes  (avg8, aec=%d)\n",
+                    i, name.c_str(), (unsigned)len, g_uvAec);
+    } else {
+      camera_fb_t* fb = captureWithLight(LED_WHITE);
+      if (!fb) { Serial.println("[PAIR] capture failed"); ok = false; break; }
+      bool stored = storePending(i, fb, name);
+      esp_camera_fb_return(fb);
+      if (!stored) { ok = false; break; }
+      Serial.printf("  [%d] %s  %u bytes  (aec=%d)\n",
+                    i, name.c_str(), fb->len, g_whiteAec);
+    }
   }
 
   setLed(LED_OFF);
