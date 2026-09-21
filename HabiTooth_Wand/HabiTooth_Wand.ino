@@ -56,10 +56,12 @@
 #define PWM_FREQ   40000
 #define PWM_RES    8
 int brightW  = 100;
-int brightUV = 255;
+int brightUV = 230;
 
 #define DEBOUNCE_MS  30
 #define MDNS_NAME  "habitooth"
+
+enum LedMode { LED_OFF = 0, LED_WHITE, LED_UV, LED_PREVIEW };
 
 // ── 노출 설정 (OV3660: aec 0~1200, agc 0~30) ──
 int g_uvAec    = 600;
@@ -71,6 +73,19 @@ int g_whiteAgc = 0;
 // ── 촬영 구역 ─────────────────────────────────
 String VIEW_TYPE = "OUTER_CENTER";
 
+static const char* const VALID_VIEWS[] = {
+  "UPPER_RIGHT_MOLAR","UPPER_RIGHT_PREMOLAR","UPPER_FRONT",
+  "UPPER_LEFT_PREMOLAR","UPPER_LEFT_MOLAR",
+  "LOWER_RIGHT_MOLAR","LOWER_RIGHT_PREMOLAR","LOWER_FRONT",
+  "LOWER_LEFT_PREMOLAR","LOWER_LEFT_MOLAR",
+  "OUTER_RIGHT","OUTER_CENTER","OUTER_LEFT"
+};
+
+bool isValidView(const String& v) {
+  for (auto* p : VALID_VIEWS) if (v == p) return true;
+  return false;
+}
+
 // ── 전역 ──────────────────────────────────────
 WebServer      server(80);
 WiFiServer     streamServer(81);
@@ -78,7 +93,7 @@ SemaphoreHandle_t camMutex;
 
 Adafruit_NeoPixel strip(NUM_PIXELS, PIN_NEO, NEO_GRB + NEO_KHZ800);
 
-enum LedMode { LED_OFF = 0, LED_WHITE, LED_UV, LED_PREVIEW };
+
 LedMode currentLed = LED_OFF;
 
 // ── 프리뷰(상시) 조명 ─────────────────────────
@@ -301,7 +316,7 @@ String timeStamp() {
 }
 
 String makeFilename(bool isUV) {
-  return VIEW_TYPE + "_" + (isUV ? "UV" : "WHITE") + "_" + timeStamp() + ".jpg";
+  return VIEW_TYPE + "-" + (isUV ? "UV" : "WHITE") + "-" + timeStamp() + ".jpg";
 }
 
 // ─────────────────────────────────────────────
@@ -557,19 +572,23 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
       <label>촬영 구역 (viewType)</label>
       <select id="view" onchange="setView()">
         <optgroup label="설측 상악">
-          <option value="UPPER_LEFT">UPPER_LEFT 상악 좌</option>
-          <option value="UPPER_CENTER">UPPER_CENTER 상악 중앙</option>
-          <option value="UPPER_RIGHT">UPPER_RIGHT 상악 우</option>
+          <option value="UPPER_RIGHT_MOLAR">UPPER_RIGHT_MOLAR 상악 우 대구치</option>
+          <option value="UPPER_RIGHT_PREMOLAR">UPPER_RIGHT_PREMOLAR 상악 우 소구치</option>
+          <option value="UPPER_FRONT">UPPER_FRONT 상악 전치부</option>
+          <option value="UPPER_LEFT_PREMOLAR">UPPER_LEFT_PREMOLAR 상악 좌 소구치</option>
+          <option value="UPPER_LEFT_MOLAR">UPPER_LEFT_MOLAR 상악 좌 대구치</option>
         </optgroup>
         <optgroup label="설측 하악">
-          <option value="LOWER_LEFT">LOWER_LEFT 하악 좌</option>
-          <option value="LOWER_CENTER">LOWER_CENTER 하악 중앙</option>
-          <option value="LOWER_RIGHT">LOWER_RIGHT 하악 우</option>
+          <option value="LOWER_RIGHT_MOLAR">LOWER_RIGHT_MOLAR 하악 우 대구치</option>
+          <option value="LOWER_RIGHT_PREMOLAR">LOWER_RIGHT_PREMOLAR 하악 우 소구치</option>
+          <option value="LOWER_FRONT">LOWER_FRONT 하악 전치부</option>
+          <option value="LOWER_LEFT_PREMOLAR">LOWER_LEFT_PREMOLAR 하악 좌 소구치</option>
+          <option value="LOWER_LEFT_MOLAR">LOWER_LEFT_MOLAR 하악 좌 대구치</option>
         </optgroup>
         <optgroup label="외측">
-          <option value="OUTER_LEFT">OUTER_LEFT 외측 좌</option>
-          <option value="OUTER_CENTER" selected>OUTER_CENTER 외측 중앙</option>
           <option value="OUTER_RIGHT">OUTER_RIGHT 외측 우</option>
+          <option value="OUTER_CENTER" selected>OUTER_CENTER 외측 중앙</option>
+          <option value="OUTER_LEFT">OUTER_LEFT 외측 좌</option>
         </optgroup>
       </select>
       <label>해상도</label>
@@ -648,6 +667,17 @@ async function loadExp(){
 }
 loadExp();
 
+async function loadBright(){
+  try{
+    const d = await (await fetch('/bright')).json();
+    document.querySelectorAll('input[type=range]')[0].value = d.w;
+    bw.textContent = d.w;
+    document.querySelectorAll('input[type=range]')[1].value = d.uv;
+    bu.textContent = d.uv;
+  }catch(e){}
+}
+loadBright();
+
 function snap(l){
   log(l.toUpperCase() + ' 촬영 → 다운로드');
   const a = document.createElement('a');
@@ -710,8 +740,9 @@ void handleLed() {
 void handleBright() {
   if (server.hasArg("w"))  brightW  = constrain(server.arg("w").toInt(),  0, 255);
   if (server.hasArg("uv")) brightUV = constrain(server.arg("uv").toInt(), 0, 255);
-  setLed(currentLed);
-  server.send(200, "text/plain", "ok");
+  if (server.args() > 0) setLed(currentLed);
+  String j = "{\"w\":" + String(brightW) + ",\"uv\":" + String(brightUV) + "}";
+  server.send(200, "application/json", j);
 }
 
 void handleExp() {
@@ -844,6 +875,7 @@ void printStatus() {
   Serial.printf("  viewType  : %s\n", VIEW_TYPE.c_str());
   Serial.printf("  UV        : aec=%d  agc=%d  밝기=%d\n", g_uvAec, g_uvAgc, brightUV);
   Serial.printf("  백색광    : aec=%d  agc=%d  밝기=%d\n", g_whiteAec, g_whiteAgc, brightW);
+  Serial.printf("  프리뷰    : aec=%d  agc=%d  밝기=%d\n", g_previewAec, g_previewAgc, g_previewBright);
   Serial.println("───────────────────────────────────────");
 }
 
