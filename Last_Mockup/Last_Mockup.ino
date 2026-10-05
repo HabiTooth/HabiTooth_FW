@@ -24,6 +24,15 @@
  * ===== 스위치 =====
  *   누르면 백색 -> UV 연속 촬영. 두 장 모두 브라우저로 자동 다운로드.
  *
+ * ===== 연속 촬영 속도 (2026-09 수정) =====
+ *   - captureWithLight: 워밍업 350ms -> 120ms, 버림 프레임 사이 delay(60) 제거,
+ *     applyProfileFor 중복 호출 제거 (setLed가 이미 호출함)
+ *   - capturePair: 백색 이미지를 버퍼에 복사하기 전에 UV LED를 미리 점등
+ *   - 웹 "백색 + UV 연속" 버튼이 /pair 로 capturePair를 직접 호출
+ *     (기존 JS의 1800ms 고정 지연 제거)
+ *   ※ 워밍업을 줄였으므로 첫 장 색이 이전 설정으로 찍히지 않는지 확인할 것.
+ *     문제가 있으면 warmupMs보다 discard를 3으로 올리는 편이 빠름.
+ *
  * ===== 접속 =====
  *   UI     : http://habitooth.local/
  *   스트림 : http://habitooth.local:81/stream
@@ -39,6 +48,7 @@
 
 #include "board_config.h"
 #include "config.h"
+#include "page_html.h"
 
 // ── LED / 스위치 / 네오픽셀 핀 (신 회로) ─────
 #define PIN_UV_LED   4    // D3
@@ -55,7 +65,7 @@
 
 #define PWM_FREQ   40000
 #define PWM_RES    8
-int brightW  = 100;
+int brightW  = 76;
 int brightUV = 230;
 
 #define DEBOUNCE_MS  30
@@ -321,17 +331,16 @@ String makeFilename(bool isUV) {
 
 // ─────────────────────────────────────────────
 // 조명 전환 후 안정화 캡처
+//   setLed 안에서 applyProfileFor가 호출되므로 여기서 다시 부르지 않음.
+//   esp_camera_fb_get() 자체가 다음 프레임을 기다리므로 delay 불필요.
 // ─────────────────────────────────────────────
-camera_fb_t* captureWithLight(LedMode mode, int warmupMs = 350, int discard = 3) {
+camera_fb_t* captureWithLight(LedMode mode, int warmupMs = 120, int discard = 2) {
   setLed(mode);
-  applyProfileFor(mode);
   delay(warmupMs);
 
-  camera_fb_t* fb = nullptr;
-  for (int i = 0; i < discard; i++) {
-    fb = esp_camera_fb_get();
+  for (int i = 0; i < discard; i++) {   // 파이프라인에 남은 구 설정 프레임 배출
+    camera_fb_t* fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
-    delay(60);
   }
   return esp_camera_fb_get();
 }
@@ -362,6 +371,7 @@ void capturePair() {
   }
 
   Serial.printf("[PAIR] %s 촬영 시작\n", VIEW_TYPE.c_str());
+  uint32_t t0 = millis();
   bool ok = true;
 
   for (int i = 0; i < 2; i++) {
@@ -370,6 +380,9 @@ void capturePair() {
 
     camera_fb_t* fb = captureWithLight(isUV ? LED_UV : LED_WHITE);
     if (!fb) { Serial.println("[PAIR] capture failed"); ok = false; break; }
+
+    // 백색 이미지를 복사하는 동안 UV 조명을 미리 켜둔다 (워밍업 선점)
+    if (!isUV) { neoFlashUV(); setLed(LED_UV); }
 
     String name = makeFilename(isUV);
     if (storePending(i, fb, name))
@@ -386,7 +399,8 @@ void capturePair() {
 
   if (ok) {
     pendSeq++;
-    Serial.printf("[PAIR] 완료 seq=%lu\n", (unsigned long)pendSeq);
+    Serial.printf("[PAIR] 완료 seq=%lu  (%lu ms)\n",
+                  (unsigned long)pendSeq, (unsigned long)(millis() - t0));
   } else {
     Serial.println("[PAIR] 실패 - seq 미증가, 브라우저 저장 안 됨");
   }
@@ -453,273 +467,6 @@ void streamTask(void* pv) {
 }
 
 // ─────────────────────────────────────────────
-// 웹 UI
-// ─────────────────────────────────────────────
-static const char PAGE_HTML[] PROGMEM = R"HTML(
-<!DOCTYPE html><html lang="ko"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HabiTooth Wand</title>
-<style>
- :root{--bg:#0f1220;--card:#191d33;--line:#2b3153;--txt:#e8ebff;
-       --dim:#8b93c4;--acc:#7c8cff;--uv:#a855f7;--ok:#34d399}
- *{box-sizing:border-box}
- body{margin:0;background:var(--bg);color:var(--txt);
-      font-family:system-ui,-apple-system,'Pretendard',sans-serif;padding:16px}
- h1{font-size:18px;margin:0 0 14px}
- h2{font-size:13px;color:var(--dim);margin:0 0 10px;font-weight:600;
-    letter-spacing:.04em;text-transform:uppercase}
-
- .wrap{max-width:1280px;margin:0 auto}
- .cols{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(340px,1fr);
-       gap:16px;align-items:start}
- .left{position:sticky;top:16px}
- .right{display:flex;flex-direction:column;gap:12px}
- @media(max-width:900px){
-   .cols{grid-template-columns:1fr}
-   .left{position:static}
- }
-
- .card{background:var(--card);border:1px solid var(--line);
-       border-radius:14px;padding:14px}
- .stage{padding:10px}
- img{width:100%;border-radius:10px;background:#000;display:block}
-
- .row{display:flex;gap:8px;flex-wrap:wrap}
- .row+.row{margin-top:8px}
- button{flex:1;min-width:90px;padding:11px;border:0;border-radius:10px;
-        background:#2a3054;color:var(--txt);font-size:14px;font-weight:600;
-        cursor:pointer;transition:transform .06s}
- button:active{transform:scale(.97);opacity:.8}
- .w{background:#e8ecff;color:#101425}
- .u{background:var(--uv);color:#fff}
- .go{background:var(--acc);color:#fff}
- .wide{flex-basis:100%}
-
- label{display:block;font-size:12px;color:var(--dim);margin:10px 0 4px}
- label:first-child{margin-top:0}
- input[type=range]{width:100%;accent-color:var(--acc)}
- select{width:100%;padding:9px;border-radius:8px;border:1px solid var(--line);
-        background:#12162a;color:var(--txt);font-size:14px}
-
- .badge{display:inline-block;padding:4px 12px;border-radius:999px;
-        font-size:12px;font-weight:700;background:#2a3054}
- .badge.on-w{background:#e8ecff;color:#101425}
- .badge.on-u{background:var(--uv);color:#fff}
- .meta{display:flex;justify-content:space-between;align-items:center;
-       font-size:12px;color:var(--dim);margin-top:10px}
-
- .hint{font-size:12px;color:var(--dim);line-height:1.7;
-       background:#12162a;border-radius:8px;padding:10px;margin-top:10px}
- .hint b{color:var(--txt)}
- .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
-      background:var(--ok);margin-right:6px;vertical-align:middle}
-
- #log{font-size:12px;color:var(--dim);white-space:pre-wrap;word-break:break-all;
-      max-height:180px;overflow:auto;line-height:1.6}
-</style></head><body><div class="wrap">
-
-<h1>HabiTooth Wand</h1>
-
-<div class="cols">
-
-  <div class="left">
-    <div class="card stage">
-      <img id="v" src="">
-      <div class="meta">
-        <span>실시간 스트림</span>
-        <span>조명 <b class="badge" id="cur">OFF</b></span>
-      </div>
-    </div>
-  </div>
-
-  <div class="right">
-
-    <div class="card">
-      <h2>조명</h2>
-      <div class="row">
-        <button class="w" onclick="led('white')">백색광</button>
-        <button class="u" onclick="led('uv')">UV</button>
-        <button       onclick="led('off')">OFF</button>
-      </div>
-      <label>백색 밝기 <span id="bw">255</span></label>
-      <input type="range" min="0" max="255" value="255"
-            oninput="bw.textContent=this.value" onchange="bright('w',this.value)">
-      <label>UV 밝기 <span id="bu">255</span></label>
-      <input type="range" min="0" max="255" value="255"
-            oninput="bu.textContent=this.value" onchange="bright('uv',this.value)">
-    </div>
-
-    <div class="card">
-      <h2>노출 (수동 고정)</h2>
-      <label>UV 노출 aec <span id="ae">200</span></label>
-      <input id="aeR" type="range" min="0" max="1200" step="10" value="200"
-             oninput="ae.textContent=this.value" onchange="exp('aec',this.value)">
-      <label>백색 노출 waec <span id="wa">750</span></label>
-      <input id="waR" type="range" min="0" max="1200" step="10" value="750"
-            oninput="wa.textContent=this.value" onchange="exp('waec',this.value)">
-      <label>UV 게인 agc <span id="ag">4</span></label>
-      <input id="agR" type="range" min="0" max="30" value="4"
-             oninput="ag.textContent=this.value" onchange="exp('agc',this.value)">
-      <div class="hint">
-        조명 버튼을 누르면 해당 모드 노출이 스트림에 바로 적용됩니다.<br>
-        <b>흰 종이를 화면에 꽉 채우고</b> 백색 노출을 올려
-        회색이 아닌 흰색으로 보이는 값을 찾으세요.
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>촬영 설정</h2>
-      <label>촬영 구역 (viewType)</label>
-      <select id="view" onchange="setView()">
-        <optgroup label="설측 상악">
-          <option value="UPPER_RIGHT_MOLAR">UPPER_RIGHT_MOLAR 상악 우 대구치</option>
-          <option value="UPPER_RIGHT_PREMOLAR">UPPER_RIGHT_PREMOLAR 상악 우 소구치</option>
-          <option value="UPPER_FRONT">UPPER_FRONT 상악 전치부</option>
-          <option value="UPPER_LEFT_PREMOLAR">UPPER_LEFT_PREMOLAR 상악 좌 소구치</option>
-          <option value="UPPER_LEFT_MOLAR">UPPER_LEFT_MOLAR 상악 좌 대구치</option>
-        </optgroup>
-        <optgroup label="설측 하악">
-          <option value="LOWER_RIGHT_MOLAR">LOWER_RIGHT_MOLAR 하악 우 대구치</option>
-          <option value="LOWER_RIGHT_PREMOLAR">LOWER_RIGHT_PREMOLAR 하악 우 소구치</option>
-          <option value="LOWER_FRONT">LOWER_FRONT 하악 전치부</option>
-          <option value="LOWER_LEFT_PREMOLAR">LOWER_LEFT_PREMOLAR 하악 좌 소구치</option>
-          <option value="LOWER_LEFT_MOLAR">LOWER_LEFT_MOLAR 하악 좌 대구치</option>
-        </optgroup>
-        <optgroup label="외측">
-          <option value="OUTER_RIGHT">OUTER_RIGHT 외측 우</option>
-          <option value="OUTER_CENTER" selected>OUTER_CENTER 외측 중앙</option>
-          <option value="OUTER_LEFT">OUTER_LEFT 외측 좌</option>
-        </optgroup>
-      </select>
-      <label>해상도</label>
-      <select onchange="res(this.value)">
-        <option value="6">VGA 640x480</option>
-        <option value="8">SVGA 800x600</option>
-        <option value="9">XGA 1024x768</option>
-        <option value="10">HD 1280x720</option>
-        <option value="13">UXGA 1600x1200</option>
-        <option value="4">QVGA 320x240</option>
-      </select>
-    </div>
-
-    <div class="card">
-      <h2>촬영</h2>
-      <div class="row">
-        <button class="go" onclick="snap('white')">백색 촬영</button>
-        <button class="go" onclick="snap('uv')">UV 촬영</button>
-      </div>
-      <div class="row">
-        <button class="wide" onclick="pair()">백색 + UV 연속</button>
-      </div>
-      <div class="hint">
-        <span class="dot"></span><b>디바이스 스위치</b>를 누르면 백색 + UV 연속 촬영됩니다.<br>
-        <span style="color:#8b93c4">※ 이 페이지가 열려 있어야 파일이 저장됩니다</span>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>네오픽셀</h2>
-      <div class="row">
-        <button onclick="neo('off')">OFF</button>
-        <button onclick="neo('g')" style="background:#0f7a3f">GREEN</button>
-        <button onclick="neo('r')" style="background:#a53030">RED</button>
-        <button onclick="neo('b')" style="background:#3060a5">BLUE</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>로그</h2>
-      <div id="log">준비됨</div>
-    </div>
-
-  </div>
-</div>
-
-<script>
-const H = location.hostname;
-document.getElementById('v').src = 'http://' + H + ':81/stream';
-
-function log(t){
-  const l = document.getElementById('log');
-  l.textContent = new Date().toLocaleTimeString() + '  ' + t + '\n' + l.textContent;
-}
-
-async function led(m){
-  const r = await fetch('/led?mode=' + m);
-  const s = await r.text();
-  const b = document.getElementById('cur');
-  b.textContent = s;
-  b.className = 'badge' + (s === 'WHITE' ? ' on-w' : s === 'UV' ? ' on-u' : '');
-}
-async function bright(k, v){ await fetch('/bright?' + k + '=' + v); }
-async function exp(k, v){ await fetch('/exp?' + k + '=' + v); log(k + ' = ' + v); }
-async function res(v){ await fetch('/res?v=' + v); log('해상도 변경'); }
-async function setView(){ await fetch('/view?v=' + view.value); log('구역: ' + view.value); }
-async function neo(c){ await fetch('/neo?c=' + c); }
-
-async function loadExp(){
-  try{
-    const d = await (await fetch('/exp')).json();
-    aeR.value = d.aec;   ae.textContent = d.aec;
-    waR.value = d.waec;  wa.textContent = d.waec;
-    agR.value = d.agc;   ag.textContent = d.agc;
-  }catch(e){}
-}
-loadExp();
-
-async function loadBright(){
-  try{
-    const d = await (await fetch('/bright')).json();
-    document.querySelectorAll('input[type=range]')[0].value = d.w;
-    bw.textContent = d.w;
-    document.querySelectorAll('input[type=range]')[1].value = d.uv;
-    bu.textContent = d.uv;
-  }catch(e){}
-}
-loadBright();
-
-function snap(l){
-  log(l.toUpperCase() + ' 촬영 → 다운로드');
-  const a = document.createElement('a');
-  a.href = '/snap?light=' + l + '&view=' + encodeURIComponent(view.value) + '&t=' + Date.now();
-  a.download = '';
-  document.body.appendChild(a); a.click(); a.remove();
-}
-function pair(){
-  snap('white');
-  setTimeout(() => snap('uv'), 1800);
-}
-
-function grab(i){
-  const a = document.createElement('a');
-  a.href = '/pend?i=' + i + '&t=' + Date.now();
-  a.download = '';
-  document.body.appendChild(a); a.click(); a.remove();
-}
-
-let lastSeq = null;
-async function poll(){
-  try {
-    const r = await fetch('/pending');
-    const d = await r.json();
-
-    if (lastSeq === null) { lastSeq = d.seq; }
-    else if (d.seq > lastSeq) {
-      lastSeq = d.seq;
-      log('스위치 촬영 수신: ' + d.w);
-      grab(0);
-      setTimeout(() => grab(1), 900);
-    }
-  } catch(e) {}
-}
-setInterval(poll, 1200);
-poll();
-</script>
-
-</div></body></html>
-)HTML";
-
-// ─────────────────────────────────────────────
 // 핸들러
 // ─────────────────────────────────────────────
 void handleRoot() {
@@ -784,6 +531,13 @@ void handleRes() {
 void handleView() {
   if (server.hasArg("v")) VIEW_TYPE = server.arg("v");
   server.send(200, "text/plain", VIEW_TYPE);
+}
+
+// 웹 "백색 + UV 연속" 버튼 - 스위치와 같은 경로
+void handlePair() {
+  if (capturing) { server.send(409, "text/plain", "busy"); return; }
+  capturePair();
+  server.send(200, "text/plain", "ok");
 }
 
 void handlePending() {
@@ -901,7 +655,7 @@ void setup() {
   Serial.setDebugOutput(false);
   delay(800);
 
-  Serial.printf("[BOOT] PSRAM %s  size=%u\n",     // ← 이 줄 추가
+  Serial.printf("[BOOT] PSRAM %s  size=%u\n",
                 psramFound() ? "감지됨" : "없음", ESP.getPsramSize());
 
   ledInit();
@@ -997,6 +751,7 @@ void setup() {
   server.on("/res",     handleRes);
   server.on("/view",    handleView);
   server.on("/snap",    handleSnap);
+  server.on("/pair",    handlePair);
   server.on("/pending", handlePending);
   server.on("/pend",    handlePend);
   server.on("/preview", handlePreview);
