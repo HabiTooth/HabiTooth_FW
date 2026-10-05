@@ -112,25 +112,25 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
     <div class="card">
       <div class="row">
         <button class="nav" onclick="stepView(-1)">◀</button>
-        <select id="view" onchange="setView()">
-          <optgroup label="설측 상악">
-            <option value="UPPER_RIGHT_MOLAR">상악 우 대구치 · UPPER_RIGHT_MOLAR</option>
-            <option value="UPPER_RIGHT_PREMOLAR">상악 우 소구치 · UPPER_RIGHT_PREMOLAR</option>
-            <option value="UPPER_FRONT">상악 전치부 · UPPER_FRONT</option>
-            <option value="UPPER_LEFT_PREMOLAR">상악 좌 소구치 · UPPER_LEFT_PREMOLAR</option>
-            <option value="UPPER_LEFT_MOLAR">상악 좌 대구치 · UPPER_LEFT_MOLAR</option>
+                <select id="view" onchange="setView()">
+          <optgroup label="외측">
+            <option value="OUTER_CENTER" selected>외측 중앙 · OUTER_CENTER</option>
+            <option value="OUTER_RIGHT">외측 우 · OUTER_RIGHT</option>
+            <option value="OUTER_LEFT">외측 좌 · OUTER_LEFT</option>
           </optgroup>
           <optgroup label="설측 하악">
-            <option value="LOWER_RIGHT_MOLAR">하악 우 대구치 · LOWER_RIGHT_MOLAR</option>
-            <option value="LOWER_RIGHT_PREMOLAR">하악 우 소구치 · LOWER_RIGHT_PREMOLAR</option>
             <option value="LOWER_FRONT">하악 전치부 · LOWER_FRONT</option>
             <option value="LOWER_LEFT_PREMOLAR">하악 좌 소구치 · LOWER_LEFT_PREMOLAR</option>
             <option value="LOWER_LEFT_MOLAR">하악 좌 대구치 · LOWER_LEFT_MOLAR</option>
+            <option value="LOWER_RIGHT_PREMOLAR">하악 우 소구치 · LOWER_RIGHT_PREMOLAR</option>
+            <option value="LOWER_RIGHT_MOLAR">하악 우 대구치 · LOWER_RIGHT_MOLAR</option>
           </optgroup>
-          <optgroup label="외측">
-            <option value="OUTER_RIGHT">외측 우 · OUTER_RIGHT</option>
-            <option value="OUTER_CENTER" selected>외측 중앙 · OUTER_CENTER</option>
-            <option value="OUTER_LEFT">외측 좌 · OUTER_LEFT</option>
+          <optgroup label="설측 상악">
+            <option value="UPPER_FRONT">상악 전치부 · UPPER_FRONT</option>
+            <option value="UPPER_LEFT_PREMOLAR">상악 좌 소구치 · UPPER_LEFT_PREMOLAR</option>
+            <option value="UPPER_LEFT_MOLAR">상악 좌 대구치 · UPPER_LEFT_MOLAR</option>
+            <option value="UPPER_RIGHT_PREMOLAR">상악 우 소구치 · UPPER_RIGHT_PREMOLAR</option>
+            <option value="UPPER_RIGHT_MOLAR">상악 우 대구치 · UPPER_RIGHT_MOLAR</option>
           </optgroup>
         </select>
         <button class="nav" onclick="stepView(1)">▶</button>
@@ -240,6 +240,17 @@ function stepView(d){
   view.selectedIndex = (view.selectedIndex + d + n) % n;
   setView();
 }
+// 키보드 ← → 로 구역 이동
+document.addEventListener('keydown', e => {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  const a = document.activeElement;
+  // 슬라이더(노출·밝기) 조작 중엔 방향키를 그쪽에 양보
+  if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA')) return;
+  if (a && a.tagName === 'SELECT' && a.id !== 'view') return; // 해상도 select
+  e.preventDefault();          // select 기본 동작과 중복 이동 방지
+  if (e.repeat) return;        // 꾹 눌러서 연속 넘어가는 것 방지
+  stepView(e.key === 'ArrowLeft' ? -1 : 1);
+});
 // 새로고침해도 디바이스(스위치 촬영)와 화면 구역이 어긋나지 않게 맞춤
 async function loadView(){
   try{
