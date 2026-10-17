@@ -118,7 +118,10 @@ uint32_t previewCoolUntil = 0;
 #define PREVIEW_MAX_MS   180000UL
 #define PREVIEW_COOL_MS   30000UL
 #define WHITE_MAX_MS      60000UL
-#define PEND_CAP  (150 * 1024)
+#define PEND_CAP  (512 * 1024)
+
+framesize_t g_streamFs  = FRAMESIZE_VGA;
+framesize_t g_captureFs = FRAMESIZE_UXGA;
 
 uint8_t*          pendBuf[2] = { nullptr, nullptr };
 size_t            pendCap[2] = { 0, 0 };
@@ -329,6 +332,12 @@ String makeFilename(bool isUV) {
   return VIEW_TYPE + "-" + (isUV ? "UV" : "WHITE") + "-" + timeStamp() + ".jpg";
 }
 
+// 해상도
+void setFs(framesize_t fs) {
+  sensor_t* s = esp_camera_sensor_get();
+  if (s && s->status.framesize != fs) s->set_framesize(s, fs);
+}
+
 // ─────────────────────────────────────────────
 // 조명 전환 후 안정화 캡처
 //   setLed 안에서 applyProfileFor가 호출되므로 여기서 다시 부르지 않음.
@@ -373,6 +382,7 @@ void capturePair() {
   Serial.printf("[PAIR] %s 촬영 시작\n", VIEW_TYPE.c_str());
   uint32_t t0 = millis();
   bool ok = true;
+  setFs(g_captureFs);
 
   for (int i = 0; i < 2; i++) {
     bool isUV = (i == 1);
@@ -393,6 +403,7 @@ void capturePair() {
     esp_camera_fb_return(fb);
   }
 
+  setFs(g_streamFs);    
   setLed(LED_OFF);
   neoOff();
   xSemaphoreGive(camMutex);
@@ -519,13 +530,13 @@ void handleExp() {
 }
 
 void handleRes() {
-  sensor_t* s = esp_camera_sensor_get();
-  if (s) {
-    s->set_framesize(s, (framesize_t)server.arg("v").toInt());
+  if (server.hasArg("v")) {
+    g_streamFs = (framesize_t)server.arg("v").toInt();
+    setFs(g_streamFs);
     delay(100);
     applyProfileFor(currentLed);
   }
-  server.send(200, "text/plain", "ok");
+  server.send(200, "text/plain", String((int)g_streamFs));
 }
 
 void handleView() {
@@ -575,6 +586,7 @@ void handleSnap() {
 
   camera_fb_t* fb = captureWithLight(isUV ? LED_UV : LED_WHITE);
   if (!fb) {
+    setFs(g_streamFs);   
     setLed(prev);
     neoOff();
     xSemaphoreGive(camMutex);
@@ -592,6 +604,7 @@ void handleSnap() {
   server.client().write(fb->buf, fb->len);
 
   esp_camera_fb_return(fb);
+  setFs(g_streamFs);
   setLed(prev);
   neoOff();
   xSemaphoreGive(camMutex);
@@ -708,7 +721,7 @@ void setup() {
   }
 
   sensor_t* s = esp_camera_sensor_get();
-  s->set_framesize(s, FRAMESIZE_VGA);
+  s->set_framesize(s, psramFound() ? g_streamFs : FRAMESIZE_SVGA);
   s->set_vflip(s, 0);
   s->set_hmirror(s, 0);
 
@@ -760,6 +773,8 @@ void setup() {
   server.begin();
 
   xTaskCreatePinnedToCore(streamTask, "stream", 8192, NULL, 1, NULL, 0);
+
+  Serial.printf("HD=%d UXGA=%d VGA=%d\n", FRAMESIZE_HD, FRAMESIZE_UXGA, FRAMESIZE_VGA);
 
   Serial.println("========================================");
   Serial.print  ("  UI     : http://"); Serial.println(WiFi.localIP());

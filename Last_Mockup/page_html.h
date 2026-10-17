@@ -40,6 +40,15 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
          font-size:12px;color:var(--dim);height:26px}
  .frame{width:100%;aspect-ratio:4/3;border-radius:10px;background:#000;
         object-fit:contain;display:block}
+ /* 스트림 위 가이드라인 오버레이 */
+ .stack{position:relative;width:100%;aspect-ratio:4/3}
+ .stack .frame{position:absolute;inset:0;height:100%}
+ .stack{overflow:hidden;border-radius:10px}
+ #gl{pointer-events:none;background:transparent;display:none;opacity:.8;
+     transform-origin:50% 50%}
+ #glSv{min-width:34px;text-align:right}
+ .pane-h .ctl{display:flex;align-items:center;gap:6px;font-size:11px}
+ .pane-h .ctl input[type=range]{width:70px;accent-color:var(--acc)}
  .empty{display:flex;align-items:center;justify-content:center;text-align:center;
         font-size:12px;color:var(--dim);line-height:1.6;padding:10px}
  .zone{font-size:13px;font-weight:700;color:var(--txt)}
@@ -90,10 +99,22 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
       <div class="views">
         <div class="pane">
           <div class="pane-h">
-            <span>실시간 스트림</span>
-            <span>조명 <b class="badge" id="cur">OFF</b></span>
+            <span>실시간 스트림 · 조명 <b class="badge" id="cur">OFF</b></span>
+            <span class="ctl">
+              <label style="margin:0;display:flex;align-items:center;gap:4px;cursor:pointer">
+                <input type="checkbox" id="glOn" checked onchange="showGuide()">가이드라인
+              </label>
+              <input type="range" id="glA" min="10" max="100" value="80" title="투명도"
+                     oninput="gl.style.opacity=this.value/100">
+              <span id="glSv">100%</span>
+              <input type="range" id="glS" min="50" max="250" value="100" title="크기"
+                     oninput="setGlScale(this.value)">
+            </span>
           </div>
-          <img id="v" class="frame" src="">
+          <div class="stack">
+            <img id="v" class="frame" src="">
+            <img id="gl" class="frame">
+          </div>
         </div>
         <div class="pane">
           <div class="pane-h">
@@ -102,7 +123,8 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
           </div>
           <img id="gimg" class="frame" style="display:none">
           <div id="gempty" class="frame empty">
-            가이드샷이 없습니다.<br>[가이드 폴더]로 사진 폴더를 선택하세요.
+            가이드샷이 없습니다.<br>[가이드 폴더]로 사진 폴더를 선택하세요.<br>
+            <small>구역이름.jpg = 가이드샷 · 구역이름_guideline.png = 스트림 오버레이</small>
           </div>
           <input type="file" id="gdir" webkitdirectory multiple hidden onchange="pickGuides(this.files)">
         </div>
@@ -179,14 +201,14 @@ static const char PAGE_HTML[] PROGMEM = R"HTML(
       <label>UV 게인 agc <span id="ag">4</span></label>
       <input id="agR" type="range" min="0" max="30" value="4"
              oninput="ag.textContent=this.value" onchange="exp('agc',this.value)">
-      <label>해상도</label>
-      <select onchange="res(this.value)">
-        <option value="6">VGA 640x480</option>
-        <option value="8">SVGA 800x600</option>
-        <option value="9">XGA 1024x768</option>
-        <option value="10">HD 1280x720</option>
-        <option value="13">UXGA 1600x1200</option>
-        <option value="4">QVGA 320x240</option>
+      <label>스트림 해상도</label>
+      <select id="resSel" onchange="res(this.value)">
+        <option value="10" selected>VGA 640x480</option>
+        <option value="11">SVGA 800x600</option>
+        <option value="12">XGA 1024x768</option>
+        <option value="13">HD 1280x720</option>
+        <option value="15">UXGA 1600x1200</option>
+        <option value="6">QVGA 320x240</option>
       </select>
     </div>
 
@@ -262,8 +284,24 @@ async function loadView(){
 
 // ── 가이드샷 (IndexedDB) ─────────────────────
 const ALIAS = { UPPER_CENTER:'UPPER_FRONT', LOWER_CENTER:'LOWER_FRONT' };
-let guides = {};
-let guideUrl = null;
+const GL_SUFFIX = '_GUIDELINE';     // 예: OUTER_CENTER_guideline.png → 스트림 오버레이
+let guides = {};                    // 구역 → 가이드샷 Blob
+let guidelines = {};                // 구역 → 가이드라인(투명 PNG) Blob
+let guideUrl = null, glUrl = null;
+
+// 가이드라인 크기 (구역별로 기억, localStorage)
+function glScaleKey(){ return 'glScale:' + view.value; }
+function setGlScale(v){
+  gl.style.transform = 'scale(' + (v / 100) + ')';
+  glSv.textContent = v + '%';
+  try { localStorage.setItem(glScaleKey(), v); } catch(e) {}
+}
+function loadGlScale(){
+  let v = 100;
+  try { v = parseInt(localStorage.getItem(glScaleKey())) || 100; } catch(e) {}
+  glS.value = v;
+  setGlScale(v);
+}
 
 function idb(){
   return new Promise((ok, ng) => {
@@ -297,9 +335,23 @@ async function idbLoad(){
   });
 }
 
+// 파일명 → { key: 구역, gl: 가이드라인 여부 }
 function keyOf(fname){
-  const k = fname.replace(/\.[^.]+$/, '').trim().toUpperCase();
-  return ALIAS[k] || k;
+  let k = fname.replace(/\.[^.]+$/, '').trim().toUpperCase();
+  const gl = k.endsWith(GL_SUFFIX);
+  if (gl) k = k.slice(0, -GL_SUFFIX.length);
+  k = ALIAS[k] || k;
+  return { key: k, gl };
+}
+
+// IndexedDB 에는 가이드샷은 "구역", 가이드라인은 "구역_GUIDELINE" 키로 같이 저장
+function splitStore(all){
+  const g = {}, l = {};
+  for (const k in all) {
+    if (k.endsWith(GL_SUFFIX)) l[k.slice(0, -GL_SUFFIX.length)] = all[k];
+    else g[k] = all[k];
+  }
+  return { g, l };
 }
 
 async function pickGuides(files){
@@ -307,16 +359,18 @@ async function pickGuides(files){
   const map = {};
   for (const f of files) {
     if (!f.type.startsWith('image/')) continue;
-    const k = keyOf(f.name);
-    if (!valid.has(k)) continue;
-    map[k] = new Blob([await f.arrayBuffer()], { type: f.type });
+    const { key, gl } = keyOf(f.name);
+    if (!valid.has(key)) continue;
+    map[gl ? key + GL_SUFFIX : key] = new Blob([await f.arrayBuffer()], { type: f.type });
   }
-  const n = Object.keys(map).length;
-  if (!n) { log('가이드: 구역 이름과 맞는 사진이 없습니다'); return; }
+  const { g, l } = splitStore(map);
+  const ng = Object.keys(g).length, nl = Object.keys(l).length;
+  if (!ng && !nl) { log('가이드: 구역 이름과 맞는 사진이 없습니다'); return; }
   try { await idbSave(map); } catch(e) { log('가이드 저장 실패: ' + e); }
-  guides = map;
-  const miss = [...valid].filter(v => !map[v]);
-  log('가이드 ' + n + '장 저장' + (miss.length ? ' · 없음: ' + miss.join(', ') : ''));
+  guides = g; guidelines = l;
+  const miss = [...valid].filter(v => !g[v]);
+  log('가이드샷 ' + ng + '장 · 가이드라인 ' + nl + '장 저장' +
+      (miss.length ? ' · 가이드샷 없음: ' + miss.join(', ') : ''));
   showGuide();
   gdir.value = '';
 }
@@ -325,9 +379,11 @@ function showGuide(){
   const k = view.value;
   const img = document.getElementById('gimg');
   const empty = document.getElementById('gempty');
+  const gl = document.getElementById('gl');
   document.getElementById('gname').textContent =
     view.options[view.selectedIndex].text.split(' · ')[0];
 
+  // 오른쪽: 가이드샷
   if (guideUrl) { URL.revokeObjectURL(guideUrl); guideUrl = null; }
   if (guides[k]) {
     guideUrl = URL.createObjectURL(guides[k]);
@@ -338,12 +394,28 @@ function showGuide(){
     img.style.display = 'none';
     empty.style.display = 'flex';
   }
+
+  // 왼쪽: 스트림 위 가이드라인 오버레이
+  if (glUrl) { URL.revokeObjectURL(glUrl); glUrl = null; }
+  if (guidelines[k] && glOn.checked) {
+    glUrl = URL.createObjectURL(guidelines[k]);
+    gl.src = glUrl;
+    gl.style.opacity = glA.value / 100;
+    loadGlScale();
+    gl.style.display = 'block';
+  } else {
+    gl.removeAttribute('src');
+    gl.style.display = 'none';
+  }
 }
 
 (async () => {
-  try { guides = await idbLoad(); } catch(e) { guides = {}; }
-  const n = Object.keys(guides).length;
-  if (n) log('가이드 ' + n + '장 불러옴');
+  let all = {};
+  try { all = await idbLoad(); } catch(e) { all = {}; }
+  const { g, l } = splitStore(all);
+  guides = g; guidelines = l;
+  const ng = Object.keys(g).length, nl = Object.keys(l).length;
+  if (ng || nl) log('가이드샷 ' + ng + '장 · 가이드라인 ' + nl + '장 불러옴');
   loadView();
 })();
 
@@ -366,6 +438,11 @@ async function loadBright(){
   }catch(e){}
 }
 loadBright();
+
+async function loadRes(){
+  try{ resSel.value = (await (await fetch('/res')).text()).trim(); }catch(e){}
+}
+loadRes();
 
 // ── 촬영 ─────────────────────────────────────
 function snap(l){
