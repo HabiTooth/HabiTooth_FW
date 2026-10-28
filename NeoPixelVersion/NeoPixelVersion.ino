@@ -67,6 +67,9 @@
  *     applyProfileFor 중복 호출 제거 (setLed가 이미 호출함)
  *   - capturePair: 백색 이미지를 버퍼에 복사하기 전에 UV LED를 미리 점등
  *   - 웹 "백색 + UV 연속" 버튼이 /pair 로 capturePair를 직접 호출
+ *   - (2026-10-28) 촬영 후 스트림 복귀 시 restoreStream(): 해상도·조명을 먼저
+ *     스트림 상태로 돌리고 전환 중 프레임 2장을 버린 뒤 뮤텍스 반환
+ *     → 촬영 직후 스트림이 지직거리던 현상 제거
  *   ※ 워밍업을 줄였으므로 첫 장 색이 이전 설정으로 찍히지 않는지 확인할 것.
  *     문제가 있으면 warmupMs보다 discard를 3으로 올리는 편이 빠름.
  *
@@ -588,15 +591,30 @@ void setFs(framesize_t fs) {
 //   setLed 안에서 applyProfileFor가 호출되므로 여기서 다시 부르지 않음.
 //   esp_camera_fb_get() 자체가 다음 프레임을 기다리므로 delay 불필요.
 // ─────────────────────────────────────────────
-camera_fb_t* captureWithLight(LedMode mode, int warmupMs = 120, int discard = 2) {
-  setLed(mode);
-  delay(warmupMs);
-
-  for (int i = 0; i < discard; i++) {   // 파이프라인에 남은 구 설정 프레임 배출
+// 파이프라인에 남은 구 설정(해상도/노출/조명) 프레임 배출
+void flushFrames(int n) {
+  for (int i = 0; i < n; i++) {
     camera_fb_t* fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
   }
+}
+
+camera_fb_t* captureWithLight(LedMode mode, int warmupMs = 120, int discard = 2) {
+  setLed(mode);
+  delay(warmupMs);
+  flushFrames(discard);
   return esp_camera_fb_get();
+}
+
+// 촬영 끝 → 스트림 복귀. 해상도·조명·노출을 먼저 스트림 상태로 돌리고
+// 전환 중 프레임 2장을 버린 뒤 뮤텍스를 풀어야 스트림 첫 프레임이 안 깨짐.
+// (뮤텍스를 쥔 상태에서 호출할 것)
+void restoreStream(LedMode fallback) {
+  setFs(g_streamFs);
+  bool wantPrev = (streamClients > 0) &&
+                  (int32_t)(millis() - previewCoolUntil) >= 0;   // 쿨다운 중이면 프리뷰 안 켬
+  setLed(wantPrev ? LED_PREVIEW : fallback);
+  flushFrames(2);
 }
 
 // ─────────────────────────────────────────────
@@ -648,8 +666,7 @@ void capturePair() {
     esp_camera_fb_return(fb);
   }
 
-  setFs(g_streamFs);
-  setLed(LED_OFF);
+  restoreStream(LED_OFF);        // 스트림 복귀 + 전환 프레임 배출
   xSemaphoreGive(camMutex);
 
   if (ok) {
@@ -899,8 +916,7 @@ void handleSnap() {
 
   camera_fb_t* fb = captureWithLight(isUV ? LED_UV : LED_WHITE);
   if (!fb) {
-    setFs(g_streamFs);
-    setLed(prev);
+    restoreStream(prev);
     xSemaphoreGive(camMutex);
     capturing = false;
     server.send(500, "text/plain", "capture failed");
@@ -917,8 +933,7 @@ void handleSnap() {
   server.client().write(fb->buf, fb->len);
 
   esp_camera_fb_return(fb);
-  setFs(g_streamFs);
-  setLed(prev);
+  restoreStream(prev);
   xSemaphoreGive(camMutex);
   capturing = false;
 }
