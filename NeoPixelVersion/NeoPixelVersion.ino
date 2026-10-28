@@ -24,10 +24,10 @@
  *     (절전 후 1~2분 뒤 버튼으로 깨워보기. 시리얼 'sleep' 명령으로도 진입 가능)
  *
  * ===== 네오픽셀 상태 (2026-10 최종안, 색 + 패턴) =====
- *   부팅 / 와이파이 연결 중   파랑   숨쉬기 (천천히 밝아졌다 어두워짐 반복)
+ *   부팅 / 와이파이 스캔·연결 중  파랑   숨쉬기 (천천히 밝아졌다 어두워짐 반복)
  *     (자동 재연결 포함)
  *   와이파이 연결됨           초록   1.5초 켜졌다 꺼짐
- *   와이파이 실패             빨강   빠른 점멸 (10초 뒤 자동 재시도 → 다시 파랑)
+ *   와이파이 실패             빨강   빠른 점멸 (10초 뒤 자동 재스캔 → 다시 파랑)
  *   LED 쿨다운 중             주황   느린 점멸 (과열 보호로 강제 소등된 경우만)
  *   절전 진입                 현재 색 페이드아웃 (꺼져 있었으면 흰색)
  *   촬영 중 / 대기            꺼짐   (촬영 중 빛이 사진에 섞이지 않게)
@@ -35,6 +35,19 @@
  *     (PSRAM 버퍼 확보 실패는 시리얼 경고만, 동작은 계속)
  *   - 꺼진(절전) 상태에선 아무것도 표시하지 않음
  *   - 우선순위: 오류 > 절전 대기 > 촬영 > 와이파이 연결중/실패 > 쿨다운 > 연결됨
+ *
+ * ===== 와이파이 우선순위 (2026-10-28) =====
+ *   config.h 의 WIFI_SSID_1 ~ 4 순서가 곧 우선순위.
+ *     1번: 팀 핫스팟 (교수님 심사용 - 데이터 연결로 안정화)
+ *     2번~: 행사장 / 학교 와이파이 (일반인 시연용)
+ *   부팅·재연결 시 먼저 주변을 스캔해서, 등록된 SSID 중 실제로 보이는 것만
+ *   순서대로 시도한다. 핫스팟이 꺼져 있으면 기다리지 않고 바로 다음으로 넘어감.
+ *   스캔에 하나도 안 잡히면(숨김 SSID 등) 예전처럼 전부 순서대로 시도.
+ *   ※ ESP32-S3는 2.4GHz 전용 → 핫스팟을 2.4GHz로 (아이폰: "최대 호환성 모드")
+ *   ※ 행사장 와이파이는 AP 격리(클라이언트 간 통신 차단)가 걸려 있는 경우가 많아
+ *     폰에서 habitooth.local / IP 접근이 안 될 수 있음 → 현장 사전 테스트 필수
+ *     시리얼 'scan' 명령으로 그 자리에서 보이는 SSID / 채널 확인 가능
+ *   ※ 캡티브 포털(동의 페이지)·WPA2-Enterprise(아이디+비번) 와이파이는 사용 불가
  *
  * ===== 라이브러리 =====
  *   - Adafruit NeoPixel  (라이브러리 매니저에서 설치)
@@ -98,12 +111,13 @@ int brightUV = 230;
 #define MDNS_NAME  "habitooth"
 
 // ── 와이파이 재시도 ───────────────────────────
+#define WIFI_SCAN_MS    8000UL   // 주변 스캔 최대 대기
 #define WIFI_TRY_MS     10000UL  // SSID 하나당 연결 시도 시간
-#define WIFI_RETRY_MS   10000UL  // 전부 실패 후 재시도까지 대기 (빨강 점멸)
+#define WIFI_RETRY_MS   10000UL  // 전부 실패 후 재스캔까지 대기 (빨강 점멸)
 #define WIFI_OK_SHOW_MS  1500UL  // 연결 성공 초록 표시 시간
 
 enum LedMode { LED_OFF = 0, LED_WHITE, LED_UV, LED_PREVIEW };
-enum NetState { NET_IDLE = 0, NET_TRYING, NET_CONNECTED, NET_FAILWAIT };
+enum NetState { NET_IDLE = 0, NET_SCANNING, NET_TRYING, NET_CONNECTED, NET_FAILWAIT };
 
 // ── 노출 설정 (OV3660: aec 0~1200, agc 0~30) ──
 int g_uvAec    = 600;
@@ -171,7 +185,7 @@ uint32_t g_whiteTestUntil = 0;      // 첫 연결 시 백색 LED 3초 점검
 
 // ── 와이파이 상태 ─────────────────────────────
 NetState netState      = NET_IDLE;
-int      netIdx        = 0;
+int      netIdx        = 0;         // 지금 시도 중인 config.h SSID 번호
 uint32_t netT          = 0;
 bool     everConnected = false;
 uint32_t g_okUntil     = 0;
@@ -223,7 +237,7 @@ uint32_t neoCompute(uint32_t now) {
   if (g_sleepArmed) { g_neoBase = g_sleepColor; return g_sleepColor; }
   if (capturing)    { g_neoBase = 0;            return 0; }
 
-  if (netState == NET_TRYING || netState == NET_IDLE) {
+  if (netState == NET_TRYING || netState == NET_SCANNING || netState == NET_IDLE) {
     g_neoBase = NEO_BLUE;  return neoBreathe(NEO_BLUE, now);
   }
   if (netState == NET_FAILWAIT) {
@@ -378,10 +392,13 @@ const char* ledName() {
 }
 
 // ─────────────────────────────────────────────
-// WiFi - 핫스팟 4개 순차 시도 (비동기, 끊기면 자동 재연결)
+// WiFi - 스캔 후 config.h 순서대로 "보이는" SSID만 시도 (비동기, 끊기면 자동 재연결)
+//   NET_SCANNING : 주변 AP 비동기 스캔 (파랑 숨쉬기, loop 안 멈춤)
 //   NET_TRYING   : 파랑 숨쉬기
-//   NET_FAILWAIT : 빨강 빠른 점멸, WIFI_RETRY_MS 뒤 처음부터 재시도
+//   NET_FAILWAIT : 빨강 빠른 점멸, WIFI_RETRY_MS 뒤 다시 스캔부터
 //   NET_CONNECTED: 초록 1.5초 후 꺼짐
+//   config.h 순서 = 우선순위 (1번 핫스팟, 2번~ 행사장 와이파이)
+//   스캔에 하나도 안 잡히면(숨김 SSID 등) 전부 순서대로 시도 (예전 동작)
 // ─────────────────────────────────────────────
 static const char* const SSIDS[] = {
   WIFI_SSID_1, WIFI_SSID_2, WIFI_SSID_3, WIFI_SSID_4
@@ -391,16 +408,55 @@ static const char* const PASSWORDS[] = {
 };
 static const int NUM_SSID = sizeof(SSIDS) / sizeof(SSIDS[0]);
 
+int netOrder[NUM_SSID];   // 이번 라운드에 시도할 config.h 번호들 (우선순위 순)
+int netCount = 0;
+int netPos   = 0;
+
 void streamTask(void* pv);
 
+void netStartScan(uint32_t now) {
+  WiFi.disconnect();
+  WiFi.scanDelete();
+  WiFi.scanNetworks(true);          // 비동기 → 네오픽셀 숨쉬기 유지
+  netState = NET_SCANNING;
+  netT = now;
+  Serial.println("[WIFI] 주변 네트워크 스캔...");
+}
+
+// 스캔 결과(found개) 중 등록된 SSID만 config.h 순서로 netOrder에 담는다
+void netBuildOrder(int found) {
+  netCount = 0;
+  for (int i = 0; i < NUM_SSID; i++) {
+    if (strlen(SSIDS[i]) == 0) continue;
+    bool seen = false;
+    int  best = -127;
+    for (int k = 0; k < found; k++) {
+      if (WiFi.SSID(k) == SSIDS[i]) {
+        seen = true;
+        if (WiFi.RSSI(k) > best) best = WiFi.RSSI(k);
+      }
+    }
+    if (seen) {
+      netOrder[netCount++] = i;
+      Serial.printf("[WIFI]  %d순위  %s  (%d dBm)\n", netCount, SSIDS[i], best);
+    }
+  }
+  if (netCount == 0) {
+    Serial.println("[WIFI] 등록된 SSID가 안 보임 - 전부 순서대로 시도");
+    for (int i = 0; i < NUM_SSID; i++)
+      if (strlen(SSIDS[i])) netOrder[netCount++] = i;
+  }
+  netPos = 0;
+}
+
 void netTryNext(uint32_t now) {
-  while (netIdx < NUM_SSID && strlen(SSIDS[netIdx]) == 0) netIdx++;
-  if (netIdx >= NUM_SSID) {
+  if (netPos >= netCount) {
     netState = NET_FAILWAIT;
     netT = now;
-    Serial.printf("[WIFI] 전부 실패 - %lu초 후 재시도\n", WIFI_RETRY_MS / 1000);
+    Serial.printf("[WIFI] 전부 실패 - %lu초 후 재스캔\n", WIFI_RETRY_MS / 1000);
     return;
   }
+  netIdx = netOrder[netPos];
   WiFi.disconnect();
   WiFi.begin(SSIDS[netIdx], PASSWORDS[netIdx]);
   Serial.printf("[WIFI] Trying %s ...\n", SSIDS[netIdx]);
@@ -411,7 +467,7 @@ void netTryNext(uint32_t now) {
 void onWifiConnected(uint32_t now) {
   netState = NET_CONNECTED;
   g_okUntil = now + WIFI_OK_SHOW_MS;
-  Serial.println("[WIFI] connected: " + WiFi.localIP().toString());
+  Serial.println("[WIFI] connected: " + WiFi.SSID() + "  " + WiFi.localIP().toString());
 
   if (MDNS.begin(MDNS_NAME)) {
     MDNS.addService("http", "tcp", 80);
@@ -438,34 +494,70 @@ void wifiTask() {
   uint32_t now = millis();
   switch (netState) {
     case NET_IDLE:
-      netIdx = 0;
+      netStartScan(now);
+      break;
+
+    case NET_SCANNING: {
+      int n = WiFi.scanComplete();
+      if (n == WIFI_SCAN_RUNNING) {
+        if (now - netT > WIFI_SCAN_MS) {
+          Serial.println("[WIFI] 스캔 시간 초과 - 전부 순서대로 시도");
+          netBuildOrder(0);
+          netTryNext(now);
+        }
+        break;
+      }
+      if (n < 0) n = 0;               // WIFI_SCAN_FAILED → 전부 시도
+      netBuildOrder(n);
+      WiFi.scanDelete();
       netTryNext(now);
       break;
+    }
+
     case NET_TRYING:
       if (WiFi.status() == WL_CONNECTED) onWifiConnected(now);
-      else if (now - netT > WIFI_TRY_MS) { netIdx++; netTryNext(now); }
+      else if (now - netT > WIFI_TRY_MS) { netPos++; netTryNext(now); }
       break;
+
     case NET_CONNECTED:
       if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WIFI] 끊김 - 자동 재연결");
+        Serial.println("[WIFI] 끊김 - 재스캔 후 자동 재연결");
         MDNS.end();
-        netIdx = 0;
-        netTryNext(now);
+        netState = NET_IDLE;        // 다음 loop에서 스캔부터
       }
       break;
+
     case NET_FAILWAIT:
-      if (now - netT > WIFI_RETRY_MS) { netIdx = 0; netTryNext(now); }
+      if (now - netT > WIFI_RETRY_MS) netState = NET_IDLE;
       break;
   }
 }
 
 const char* netName() {
   switch (netState) {
+    case NET_SCANNING:  return "스캔 중";
     case NET_TRYING:    return "연결 중";
     case NET_CONNECTED: return "연결됨";
-    case NET_FAILWAIT:  return "실패(재시도 대기)";
+    case NET_FAILWAIT:  return "실패(재스캔 대기)";
     default:            return "대기";
   }
+}
+
+// 시리얼 'scan' - 현장에서 보이는 네트워크 확인용 (동기, 몇 초 멈춤)
+void printScan() {
+  if (netState == NET_SCANNING) { Serial.println("[SCAN] 자동 스캔 중 - 잠시 후 다시"); return; }
+  Serial.println("[SCAN] 스캔 중 (2~4초)...");
+  int n = WiFi.scanNetworks();
+  if (n <= 0) { Serial.println("[SCAN] 보이는 네트워크 없음"); WiFi.scanDelete(); return; }
+  for (int k = 0; k < n; k++) {
+    bool reg = false;
+    for (int i = 0; i < NUM_SSID; i++) if (strlen(SSIDS[i]) && WiFi.SSID(k) == SSIDS[i]) reg = true;
+    Serial.printf("  %2d. %-24s %4d dBm  ch%-2d  %s%s\n",
+                  k + 1, WiFi.SSID(k).c_str(), WiFi.RSSI(k), WiFi.channel(k),
+                  WiFi.encryptionType(k) == WIFI_AUTH_OPEN ? "open" : "secured",
+                  reg ? "   <- config.h 등록됨" : "");
+  }
+  WiFi.scanDelete();
 }
 
 // ─────────────────────────────────────────────
@@ -861,7 +953,10 @@ void printStatus() {
   sensor_t* s = esp_camera_sensor_get();
   Serial.println("── 상태 ───────────────────────────────");
   if (s) Serial.printf("  PID       : 0x%x\n", s->id.PID);
-  Serial.printf("  WiFi      : %s\n", netName());
+  Serial.printf("  WiFi      : %s", netName());
+  if (netState == NET_CONNECTED)
+    Serial.printf("  (%s  %s  %d dBm)", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  Serial.println();
   Serial.printf("  조명      : %s\n", ledName());
   Serial.printf("  viewType  : %s\n", VIEW_TYPE.c_str());
   Serial.printf("  UV        : aec=%d  agc=%d  밝기=%d\n", g_uvAec, g_uvAgc, brightUV);
@@ -875,6 +970,8 @@ void printHelp() {
   Serial.println("  w / u / o      백색 / UV / 끄기");
   Serial.println("  c              백색+UV 연속 촬영");
   Serial.println("  sw             스위치 상태");
+  Serial.println("  scan           주변 와이파이 목록 (현장 확인용)");
+  Serial.println("  wifi           와이파이 재스캔·재연결");
   Serial.println("  sleep          절전 진입 (부스터 차단 테스트용)");
   Serial.println("  aec <0-1200>   UV 노출");
   Serial.println("  waec <0-1200>  백색광 노출");
@@ -988,7 +1085,7 @@ void setup() {
   server.on("/neo",     handleNeo);
   server.enableCORS(true);
 
-  // 와이파이는 loop의 wifiTask에서 비동기로 연결 (연결 중 파랑 숨쉬기)
+  // 와이파이는 loop의 wifiTask에서 비동기로 스캔·연결 (연결 중 파랑 숨쉬기)
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(false);   // 재연결은 wifiTask가 직접 관리
@@ -1038,6 +1135,12 @@ void handleSerial() {
   else if (cmd == "o")  { setLed(LED_OFF);   Serial.println("OFF"); }
   else if (cmd == "c")  { capturePair(); }
   else if (cmd == "sleep") { g_sleepColor = NEO_SOFTW; enterDeepSleep(); }
+  else if (cmd == "scan")  { printScan(); }
+  else if (cmd == "wifi")  {
+    if (netState == NET_CONNECTED) MDNS.end();
+    netState = NET_IDLE;
+    Serial.println("[WIFI] 재스캔·재연결");
+  }
   else if (cmd == "n")  {
     static int idx = 0;
     const uint32_t seq[] = {
